@@ -369,17 +369,40 @@ def ingest_document(
         for record, vector in zip(records, vectors)
     ]
 
+    delete_filter = Filter(
+        must=[
+            FieldCondition(key="source", match=MatchValue(value=filename)),
+            FieldCondition(key="project_id", match=MatchValue(value=project_id)),
+        ]
+    )
     try:
-        delete_filter = Filter(
-            must=[
-                FieldCondition(key="source", match=MatchValue(value=filename)),
-                FieldCondition(key="project_id", match=MatchValue(value=project_id)),
-            ]
-        )
         client.delete(collection_name=collection, points_selector=delete_filter)
         logger.info("Đã xoá chunk cũ (nếu có) của file '%s' trong project_id='%s' trước khi nạp lại.", filename, project_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Không xoá được chunk cũ của '%s' (có thể là lần nạp đầu tiên, bỏ qua): %s", filename, exc)
+        # Lỗi thực tế gặp trên production: Qdrant từ chối filter trên field "source"
+        # nếu collection thiếu payload index cho field đó ("Index required but not
+        # found") - script setup_qdrant_collections.py giờ đã tạo sẵn index này, NHƯNG
+        # collection tạo TRƯỚC bản sửa đó sẽ vẫn thiếu. Tự dò đúng lỗi này, tự tạo
+        # index rồi thử xoá lại 1 LẦN DUY NHẤT - không bắt Kỹ sư Long phải nhớ chạy
+        # lại script thủ công. Nếu vẫn lỗi (lý do khác), rơi về fail-soft như cũ
+        # (không chặn việc nạp tài liệu mới, chỉ là chunk cũ trùng tên chưa bị xoá).
+        if "Index required but not found" in str(exc) and "source" in str(exc):
+            logger.warning(
+                "Collection '%s' thiếu payload index 'source' (dữ liệu cũ trước bản vá) - "
+                "tự tạo index rồi thử xoá chunk cũ lại 1 lần.", collection,
+            )
+            try:
+                from qdrant_client.models import PayloadSchemaType
+
+                client.create_payload_index(
+                    collection_name=collection, field_name="source", field_schema=PayloadSchemaType.KEYWORD
+                )
+                client.delete(collection_name=collection, points_selector=delete_filter)
+                logger.info("Đã tự sửa index và xoá chunk cũ của '%s' thành công.", filename)
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning("Tự sửa index thất bại, bỏ qua bước xoá chunk cũ của '%s': %s", filename, exc2)
+        else:
+            logger.warning("Không xoá được chunk cũ của '%s' (có thể là lần nạp đầu tiên, bỏ qua): %s", filename, exc)
 
     client.upsert(collection_name=collection, points=points)
     logger.info(

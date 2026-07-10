@@ -85,16 +85,23 @@ def main() -> int:
             print(f"[OK] Collection '{name}' đã tồn tại và đúng vector_size={VECTOR_SIZE}, bỏ qua.")
 
         # Payload index cho project_id - bắt buộc để Multi-tenant filter hiệu quả.
+        # Payload index cho source - bắt buộc để ingest_document() xoá được chunk cũ
+        # cùng tên file trước khi nạp lại (lỗi thực tế gặp: "Index required but not
+        # found for 'source'" - Qdrant từ chối MỌI filter trên field chưa có index,
+        # kể cả filter dùng cho delete). Thiếu index này KHÔNG làm sập upload (đã bắt
+        # lỗi fail-soft trong ingest_document), nhưng khiến chunk cũ KHÔNG BAO GIỜ bị
+        # xoá khi nạp lại cùng 1 file - dữ liệu trùng lặp tích tụ dần trong Qdrant.
         # create_payload_index tự bỏ qua nếu index đã tồn tại (không lỗi khi chạy lại).
-        try:
-            client.create_payload_index(
-                collection_name=name,
-                field_name="project_id",
-                field_schema=PayloadSchemaType.KEYWORD,
-            )
-            print(f"[OK] Đã đảm bảo payload index 'project_id' trên collection '{name}'.")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[CẢNH BÁO] Không tạo được payload index cho '{name}' (có thể đã tồn tại): {exc}")
+        for field_name in ("project_id", "source"):
+            try:
+                client.create_payload_index(
+                    collection_name=name,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+                print(f"[OK] Đã đảm bảo payload index '{field_name}' trên collection '{name}'.")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[CẢNH BÁO] Không tạo được payload index '{field_name}' cho '{name}' (có thể đã tồn tại): {exc}")
 
     print("Hoàn tất setup Qdrant collections.")
     return 0
