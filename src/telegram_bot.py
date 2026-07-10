@@ -505,6 +505,17 @@ def _polling_loop(compiled_graph):
     """
     Vòng lặp long-polling chính, tự động reconnect khi mất mạng. Chạy ở
     background thread (daemon) để không chặn FastAPI event loop chính.
+
+    QUAN TRỌNG - đã từng có lỗi thực tế: dùng bot.infinity_polling(...) (vốn được
+    quảng cáo là tự retry vô hạn) nhưng khi gặp lỗi 409 Conflict (thường chỉ là
+    xung đột NGẮN HẠN lúc Render đang chuyển từ instance cũ sang instance mới khi
+    deploy/restart), thư viện telebot lại ÂM THẦM DỪNG HẲN vòng polling nội bộ và
+    KHÔNG BAO GIỜ tự thử lại - khiến bot "chết" vĩnh viễn cho tới khi có người vào
+    Render bấm Restart tay. Để không bao giờ phụ thuộc vào cơ chế retry nội bộ của
+    thư viện (vốn không đáng tin cậy ở đây), dùng bot.polling() (KHÔNG dùng
+    infinity_polling) và tự đảm bảo luôn sleep + quay lại đầu vòng lặp NGOÀI CÙNG
+    dù bot.polling() kết thúc theo cách nào (raise exception hay tự return) -
+    dùng try/finally thay vì chỉ try/except để đảm bảo chắc chắn 100% job này.
     """
     while True:
         try:
@@ -512,14 +523,22 @@ def _polling_loop(compiled_graph):
             global _bot_instance
             _bot_instance = bot
             logger.info("Telegram bot bắt đầu long-polling.")
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+            bot.polling(non_stop=False, interval=1, timeout=30, long_polling_timeout=30)
+            logger.warning(
+                "Vòng polling của Telegram bot đã tự kết thúc (không phải do lỗi) - "
+                "sẽ khởi động lại sau %ss.",
+                RETRY_SLEEP_SECONDS,
+            )
         except Exception as exc:  # noqa: BLE001 - bắt mọi lỗi để vòng lặp không bao giờ chết hẳn
             logger.error(
-                "Telegram bot gặp lỗi (mất mạng / token sai / Telegram API down): %s. "
-                "Ngủ đông %ss rồi thử kết nối lại.",
+                "Telegram bot gặp lỗi (mất mạng / token sai / xung đột 409 tạm thời / "
+                "Telegram API down): %s. Ngủ đông %ss rồi thử kết nối lại.",
                 exc,
                 RETRY_SLEEP_SECONDS,
             )
+        finally:
+            # LUÔN sleep + quay lại vòng lặp, bất kể bot.polling() thoát ra vì lý do
+            # gì - đây là điểm mấu chốt khắc phục lỗi "bot chết im lặng" đã gặp.
             time.sleep(RETRY_SLEEP_SECONDS)
 
 
