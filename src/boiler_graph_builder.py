@@ -10,7 +10,12 @@ Luồng định tuyến:
       -> loop_guard_edge          (conditional: loop_counter >= MAX -> circuit_breaker_node;
                                     ADMIN luôn được bỏ qua Loop Guard - xem "Admin God Mode")
       -> vision_analysis_node     (nếu có ảnh đính kèm -> gọi Vision Model phân tích)
-      -> rag_retrieval_node       (Dual-RAG: truy hồi Qdrant knowledge + history, lọc theo project_id)
+      -> query_router_node        (Task 32: phân loại nhẹ "numeric_lookup" vs "general" để
+                                    điều chỉnh cách RAG truy hồi bên dưới)
+      -> rag_retrieval_node       (Advanced RAG lite - Task 30/31/33: Hybrid Search (dense
+                                    Gemini + sparse BM25, alpha weighting) lấy pool ứng viên rộng
+                                    từ Qdrant knowledge + history, lọc theo project_id, rồi Rerank
+                                    (Cohere Rerank API) chọn lại top-K liên quan nhất)
       -> emergency_router_node    (quét từ khóa khẩn cấp trên raw_message + vision_summary)
       -> post_rule_layer_edge     (conditional: emergency > standard)
            -> emergency_handler_node  (ưu tiên tuyệt đối, phản hồi tức thì không qua LLM)
@@ -45,6 +50,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from typing import Literal
 
@@ -205,6 +211,45 @@ def vision_analysis_node(state: AgentState) -> AgentState:
     return {"vision_summary": "", "routing_log": [error_msg]}
 
 
+# Tu khoa/tin hieu cho thay cau hoi dang TRA CUU SO LIEU/BANG BIEU cu the (Task 32:
+# dinh tuyen nhe, khong goi them 1 luot LLM rieng de tranh ton do tre/chi phi - dung
+# heuristic tu khoa + regex, du dung cho quy mo 1 nha may; neu sau nay thay chua du
+# chinh xac, co the nang cap thanh 1 lenh goi LLM phan loai rieng).
+_NUMERIC_LOOKUP_KEYWORDS = (
+    "bảng", "thông số", "áp suất", "nhiệt độ", "pause", "định mức", "ngưỡng",
+    "chỉ số", "tần suất", "công suất", "lưu lượng", "tỷ lệ", "%", "bar", "độ c",
+    "kg/h", "m3", "phút", "giây", "giờ",
+)
+_NUMBER_RE = re.compile(r"\d")
+
+
+def query_router_node(state: AgentState) -> AgentState:
+    """
+    Phan loai nhe (Task 32 - Agentic Routing) truoc khi vao rag_retrieval_node:
+    cau hoi TRA SO LIEU/BANG BIEU ("numeric_lookup") can pool ung vien rong hon va
+    uu tien khop tu khoa (BM25) hon la hieu ngu nghia thuan tuy, vi du lieu dang
+    nam rai rac o nhieu dong bang khac nhau va sai lech 1 con so la khong chap
+    nhan duoc trong van hanh cong nghiep. Cau hoi con lai ("general" - khai niem/
+    quy trinh/nguyen nhan-giai phap) giu nguyen ty le hybrid mac dinh.
+
+    CHU Y THIET KE: day la phan loai bang heuristic (tu khoa + regex so), KHONG
+    goi them LLM - dung 0 chi phi/do tre, phu hop quy mo bot noi bo 1 nha may.
+    Day la danh doi da duoc thong bao: neu do chinh xac phan loai chua du tot,
+    huong nang cap tiep theo la 1 lenh goi LLM nho (nhu "viet lai cau hoi" da de
+    xuat truoc do) de phan loai chinh xac hon, doi lay them ~0.3-0.5s do tre.
+    """
+    raw_message = state.get("raw_message", "")
+    text_lower = _normalize(raw_message)
+
+    has_keyword = any(kw in text_lower for kw in _NUMERIC_LOOKUP_KEYWORDS)
+    has_number = bool(_NUMBER_RE.search(raw_message))
+    query_type = "numeric_lookup" if (has_keyword and has_number) else "general"
+
+    log_line = f"[query_router_node] query_type={query_type}"
+    logger.info(log_line)
+    return {"query_type": query_type, "routing_log": [log_line]}
+
+
 def rag_retrieval_node(state: AgentState) -> AgentState:
     """
     Dual-RAG: truy hồi Qdrant (knowledge base + incident history), CHỈ trong
@@ -228,7 +273,8 @@ def rag_retrieval_node(state: AgentState) -> AgentState:
     try:
         from src.rag_retriever import retrieve_dual_rag_context
 
-        result = retrieve_dual_rag_context(combined_query, project_id=project_id)
+        query_type = state.get("query_type", "general")
+        result = retrieve_dual_rag_context(combined_query, project_id=project_id, query_type=query_type)
         log_line = f"[rag_retrieval_node] project_id={project_id} tìm thấy {len(result['sources'])} nguồn tham khảo"
         logger.info(log_line)
         return {
@@ -505,6 +551,7 @@ def build_graph():
     graph.add_node("entry_node", entry_node)
     graph.add_node("circuit_breaker_node", circuit_breaker_node)
     graph.add_node("vision_analysis_node", vision_analysis_node)
+    graph.add_node("query_router_node", query_router_node)
     graph.add_node("rag_retrieval_node", rag_retrieval_node)
     graph.add_node("emergency_router_node", emergency_router_node)
     graph.add_node("emergency_handler_node", emergency_handler_node)
@@ -525,7 +572,8 @@ def build_graph():
     graph.add_edge("circuit_breaker_node", "logging_node")
 
     # Vision -> Dual-RAG -> Emergency Router (chuỗi tuần tự, không điều kiện)
-    graph.add_edge("vision_analysis_node", "rag_retrieval_node")
+    graph.add_edge("vision_analysis_node", "query_router_node")
+    graph.add_edge("query_router_node", "rag_retrieval_node")
     graph.add_edge("rag_retrieval_node", "emergency_router_node")
 
     # Sau Rule Layer: Emergency ưu tiên tuyệt đối, còn lại (mọi role) -> standard_llm_node

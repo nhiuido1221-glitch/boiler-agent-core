@@ -26,6 +26,11 @@ class AgentState(TypedDict, total=False):
     # --- Ket qua phan tich anh (Phase 4: vision_analysis_node) ---
     vision_summary: str
 
+    # --- Phan loai cau hoi (Task 32: query_router_node) - dieu chinh cach RAG
+    # truy hoi: "numeric_lookup" (tra bang/thong so, uu tien khop tu khoa) vs
+    # "general" (khai niem/quy trinh, uu tien hieu ngu nghia) ---
+    query_type: Literal["numeric_lookup", "general"]
+
     # --- Ket qua Dual-RAG (Phase 4: rag_retrieval_node, Qdrant) ---
     rag_context: str
     rag_sources: List[dict]

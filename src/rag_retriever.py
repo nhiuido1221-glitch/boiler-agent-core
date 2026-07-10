@@ -25,14 +25,26 @@ task_type cho từng chiều: "RETRIEVAL_DOCUMENT" khi nạp tài liệu, "RETRI
 tìm kiếm theo câu hỏi - giúp độ chính xác tốt hơn hẳn so với kiểu tiền tố "query:"/
 "passage:" thủ công của các model cũ.
 
+Hybrid Search (Nâng cấp "Advanced RAG lite"): thay vì chỉ tìm bằng vector (dense,
+hiểu ngữ nghĩa nhưng đôi khi bỏ lỡ từ khóa/số liệu chính xác), giờ kết hợp thêm
+BM25 (sparse, khớp từ khóa/số liệu chính xác - mạnh cho câu hỏi tra thông số/bảng
+biểu) qua thư viện `rank_bm25` (thuần Python, không tải model, không tốn RAM đáng
+kể). 2 điểm số được gộp theo trọng số RAG_HYBRID_ALPHA (0=chỉ BM25, 1=chỉ vector,
+mặc định 0.5) - đúng theo yêu cầu "hybrid search + alpha weighting" của anh Long,
+nhưng KHÔNG dùng model embedding nặng (BGE-m3) như đề xuất gốc vì sẽ tái lặp lỗi
+OOM 512MB đã sửa - đây là quyết định anh Long đã chọn ("dùng bản thay thế qua API"
+thay vì nâng cấp gói Render trả phí).
+
 Nguyên tắc công nghiệp: nếu Qdrant không kết nối được, KHÔNG được làm sập
 luồng xử lý chính - trả về context rỗng và log cảnh báo, để hệ thống vẫn
-trả lời được (chỉ là không có RAG) thay vì crash toàn bộ request.
+trả lời được (chỉ là không có RAG) thay vì crash toàn bộ request. Tương tự,
+nếu BM25/rerank lỗi, tự động rơi về kết quả vector thuần thay vì crash.
 """
 from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import lru_cache
 from typing import Optional
 
@@ -50,6 +62,24 @@ GEMINI_BATCH_SIZE = 90
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
 SHARED_PROJECT_ID = os.getenv("SHARED_KNOWLEDGE_TAG", "shared")
+
+# --- Hybrid search (Task 30) ---
+# Trọng số gộp điểm dense (vector) vs sparse (BM25): final = alpha*dense + (1-alpha)*sparse.
+RAG_HYBRID_ALPHA = float(os.getenv("RAG_HYBRID_ALPHA", "0.5"))
+# Số ứng viên lấy rộng ra trước khi rerank (Task 31) chọn lại top_k cuối cùng.
+RAG_CANDIDATE_POOL_SIZE = int(os.getenv("RAG_CANDIDATE_POOL_SIZE", "20"))
+# Trần số điểm scroll ra để đánh BM25 - tránh scroll toàn bộ kho nếu kho quá lớn
+# (kho nội bộ 1 nhà máy hiếm khi vượt mức này; nếu vượt, BM25 sẽ chỉ tính trên
+# phần đầu quét được thay vì tốn quá nhiều thời gian/băng thông).
+BM25_SCROLL_CAP = int(os.getenv("RAG_BM25_SCROLL_CAP", "500"))
+
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tách từ đơn giản (lowercase + regex \\w+) - đủ dùng cho BM25 tiếng Việt có dấu,
+    không cần stemming (BM25 chỉ cần khớp từ y hệt, không cần hiểu nghĩa)."""
+    return _TOKEN_RE.findall(text.lower())
 
 
 def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
@@ -136,38 +166,162 @@ def _build_project_filter(project_id: str):
     )
 
 
-def _search_collection(collection_name: str, query_vector: list[float], top_k: int, project_id: str) -> list[dict]:
+def _point_to_dict(point_id, score: float, payload: dict, collection_name: str) -> dict:
+    return {
+        "id": str(point_id),
+        "score": score,
+        "text": payload.get("text", ""),
+        "source": payload.get("source", collection_name),
+        "project_id": payload.get("project_id", ""),
+        "incident_name": payload.get("incident_name", ""),
+        "boiler_type_tag": payload.get("boiler_type_tag", ""),
+    }
+
+
+def _search_collection(
+    collection_name: str,
+    query_vector: list[float],
+    top_k: int,
+    project_id: str,
+    score_threshold: Optional[float] = None,
+) -> list[dict]:
     """
-    Truy vấn 1 collection Qdrant bằng API mới `query_points` (API `search` cũ
-    đã bị loại bỏ từ qdrant-client bản mới), có áp bộ lọc project_id.
+    Truy vấn dense (vector) 1 collection Qdrant bằng API `query_points`, có áp bộ
+    lọc project_id. `score_threshold=None` dùng ngưỡng mặc định RAG_SCORE_THRESHOLD;
+    truyền 0.0 khi cần lấy pool rộng cho hybrid search (không cắt sớm theo ngưỡng).
     """
     client = _get_qdrant_client()
+    threshold = RAG_SCORE_THRESHOLD if score_threshold is None else score_threshold
     try:
         response = client.query_points(
             collection_name=collection_name,
             query=query_vector,
             query_filter=_build_project_filter(project_id),
             limit=top_k,
-            score_threshold=RAG_SCORE_THRESHOLD,
+            score_threshold=threshold,
             with_payload=True,
         )
-        results = []
-        for point in response.points:
-            payload = point.payload or {}
-            results.append(
-                {
-                    "score": point.score,
-                    "text": payload.get("text", ""),
-                    "source": payload.get("source", collection_name),
-                    "project_id": payload.get("project_id", ""),
-                    "incident_name": payload.get("incident_name", ""),
-                    "boiler_type_tag": payload.get("boiler_type_tag", ""),
-                }
-            )
-        return results
+        return [
+            _point_to_dict(point.id, point.score, point.payload or {}, collection_name)
+            for point in response.points
+        ]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không truy vấn được collection '%s': %s", collection_name, exc)
         return []
+
+
+def _scroll_all_chunks(collection_name: str, project_id: str, cap: int = BM25_SCROLL_CAP) -> list[dict]:
+    """
+    Quét (scroll) toàn bộ điểm dữ liệu khớp project_id trong 1 collection, dùng làm
+    kho ứng viên cho BM25 (BM25 cần thấy toàn bộ tập văn bản để tính điểm khớp từ,
+    khác với dense search vốn tra cứu trực tiếp qua chỉ mục vector). Có trần `cap`
+    để tránh quét không giới hạn nếu kho quá lớn - đủ dùng cho quy mô 1 nhà máy.
+    """
+    client = _get_qdrant_client()
+    chunks: list[dict] = []
+    try:
+        next_offset = None
+        while len(chunks) < cap:
+            points, next_offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=_build_project_filter(project_id),
+                limit=min(200, cap - len(chunks)),
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                chunks.append(_point_to_dict(point.id, 0.0, point.payload or {}, collection_name))
+            if next_offset is None or not points:
+                break
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không scroll được collection '%s' để đánh BM25: %s", collection_name, exc)
+    return chunks
+
+
+def _bm25_search(collection_name: str, query: str, top_k: int, project_id: str) -> list[dict]:
+    """
+    Tìm sparse (từ khóa) bằng BM25 trên toàn bộ chunk khớp project_id của 1
+    collection. Điểm số được chuẩn hoá về [0, 1] (chia cho điểm cao nhất trong
+    pool) để gộp được với điểm dense (vốn đã trong khoảng tương tự) ở bước hybrid.
+
+    Nếu rank_bm25 lỗi/import fail hoặc pool rỗng: trả về [] - hybrid search phía
+    trên sẽ tự rơi về dùng thuần điểm dense, không crash.
+    """
+    chunks = _scroll_all_chunks(collection_name, project_id)
+    if not chunks:
+        return []
+
+    try:
+        from rank_bm25 import BM25Okapi
+
+        tokenized_corpus = [_tokenize(c["text"]) for c in chunks]
+        bm25 = BM25Okapi(tokenized_corpus)
+        raw_scores = bm25.get_scores(_tokenize(query))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lỗi tính BM25 cho collection '%s' (bỏ qua sparse search): %s", collection_name, exc)
+        return []
+
+    max_score = max(raw_scores) if len(raw_scores) else 0.0
+    for chunk, raw_score in zip(chunks, raw_scores):
+        chunk["score"] = (raw_score / max_score) if max_score > 0 else 0.0
+
+    chunks.sort(key=lambda c: c["score"], reverse=True)
+    return chunks[:top_k]
+
+
+def _hybrid_search(
+    collection_name: str,
+    query: str,
+    query_vector: list[float],
+    top_k: int,
+    project_id: str,
+    alpha: float = RAG_HYBRID_ALPHA,
+) -> list[dict]:
+    """
+    Kết hợp dense (vector, hiểu ngữ nghĩa) + sparse (BM25, khớp từ khóa/số liệu
+    chính xác) trên CÙNG 1 collection, gộp điểm theo trọng số alpha:
+        final_score = alpha * dense_norm + (1 - alpha) * sparse_norm
+    alpha=1 -> chỉ dùng dense (hành vi cũ), alpha=0 -> chỉ dùng BM25.
+
+    Cả 2 nhánh đều lấy rộng hơn top_k cuối cùng (dùng chính top_k truyền vào, vốn
+    thường là RAG_CANDIDATE_POOL_SIZE khi gọi từ retrieve_dual_rag_context) để có
+    đủ ứng viên tốt trước khi rerank ở bước sau (Task 31) hoặc cắt trực tiếp nếu
+    rerank không khả dụng.
+    """
+    dense_hits = _search_collection(collection_name, query_vector, top_k, project_id, score_threshold=0.0)
+    sparse_hits = _bm25_search(collection_name, query, top_k, project_id) if alpha < 1.0 else []
+
+    # Chuẩn hoá min-max điểm dense trong pool này để cùng thang đo với sparse
+    # (đã chuẩn hoá 0-1 ở _bm25_search) - tránh trường hợp cosine score co cụm
+    # hẹp (vd 0.3-0.45) làm alpha weighting mất tác dụng.
+    dense_scores = [h["score"] for h in dense_hits]
+    d_min, d_max = (min(dense_scores), max(dense_scores)) if dense_scores else (0.0, 0.0)
+    d_range = (d_max - d_min) or 1.0
+
+    merged: dict[str, dict] = {}
+    for h in dense_hits:
+        dense_norm = (h["score"] - d_min) / d_range
+        item = dict(h)
+        item["dense_score"] = round(h["score"], 4)
+        item["sparse_score"] = 0.0
+        item["score"] = alpha * dense_norm
+        merged[h["id"]] = item
+
+    for h in sparse_hits:
+        sparse_norm = h["score"]  # đã chuẩn hoá 0-1 sẵn
+        if h["id"] in merged:
+            merged[h["id"]]["sparse_score"] = round(sparse_norm, 4)
+            merged[h["id"]]["score"] += (1 - alpha) * sparse_norm
+        else:
+            item = dict(h)
+            item["dense_score"] = 0.0
+            item["sparse_score"] = round(sparse_norm, 4)
+            item["score"] = (1 - alpha) * sparse_norm
+            merged[h["id"]] = item
+
+    results = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
 
 
 def list_documents(project_id: str) -> dict[str, dict[str, int]]:
@@ -211,16 +365,34 @@ def list_documents(project_id: str) -> dict[str, dict[str, int]]:
     return result
 
 
-def retrieve_dual_rag_context(query: str, project_id: str = "", top_k: int = RAG_TOP_K) -> dict:
+def retrieve_dual_rag_context(
+    query: str,
+    project_id: str = "",
+    top_k: int = RAG_TOP_K,
+    query_type: str = "general",
+) -> dict:
     """
-    Hàm chính: truy hồi song song cả 2 collection (knowledge + history),
-    CHỈ trong phạm vi project_id hiện tại + kho dùng chung, trả về dict gồm
-    text ngữ cảnh đã gộp và danh sách nguồn tham khảo.
+    Hàm chính: truy hồi song song cả 2 collection (knowledge + history), CHỈ trong
+    phạm vi project_id hiện tại + kho dùng chung, trả về dict gồm text ngữ cảnh đã
+    gộp và danh sách nguồn tham khảo.
 
-    Nếu quá trình embedding hoặc Qdrant lỗi (mất mạng, sai API key,
-    collection chưa được tạo...), trả về context rỗng thay vì raise
-    exception - giữ đúng chuẩn công nghiệp "không được làm sập luồng chính".
+    Luồng "Advanced RAG lite" (Task 30-33):
+      1) Hybrid search (dense + BM25, alpha weighting) lấy 1 pool ứng viên RỘNG
+         (RAG_CANDIDATE_POOL_SIZE, không phải top_k) từ mỗi collection.
+      2) Rerank (Cohere Rerank API, module reranker.py) chọn lại đúng top_k liên
+         quan nhất trong pool đó - bù cho cả dense lẫn BM25 đều có thể "gần đúng
+         nhưng sai trọng tâm".
+      3) query_type (từ node phân loại câu hỏi trong boiler_graph_builder.py) điều
+         chỉnh pool_size: câu hỏi tra số liệu/bảng biểu (numeric_lookup) cần pool
+         rộng hơn vì dữ liệu thường nằm rải rác ở nhiều dòng bảng khác nhau.
+
+    Nếu quá trình embedding hoặc Qdrant lỗi (mất mạng, sai API key, collection chưa
+    được tạo...), trả về context rỗng thay vì raise exception - giữ đúng chuẩn công
+    nghiệp "không được làm sập luồng chính". Tương tự, nếu BM25/rerank lỗi, tự động
+    rơi về kết quả dense-only thay vì crash.
     """
+    from src.reranker import rerank_candidates
+
     knowledge_collection = os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
     history_collection = os.getenv("QDRANT_COLLECTION_HISTORY", "boiler_incident_history")
     effective_project_id = project_id or os.getenv("DEFAULT_PROJECT_ID", "boiler_default")
@@ -231,10 +403,28 @@ def retrieve_dual_rag_context(query: str, project_id: str = "", top_k: int = RAG
         logger.warning("Lỗi tạo embedding cho RAG, bỏ qua RAG cho request này: %s", exc)
         return {"context_text": "", "sources": []}
 
-    knowledge_hits = _search_collection(knowledge_collection, query_vector, top_k, effective_project_id)
-    history_hits = _search_collection(history_collection, query_vector, top_k, effective_project_id)
+    # numeric_lookup (tra bảng/thông số) -> cần pool rộng hơn để không bỏ sót dòng
+    # dữ liệu đúng, và ưu tiên BM25 hơn (alpha thấp hơn) vì tra số liệu cần khớp
+    # từ khóa/đơn vị chính xác hơn là "hiểu ngữ nghĩa" chung chung.
+    if query_type == "numeric_lookup":
+        pool_size = max(RAG_CANDIDATE_POOL_SIZE, top_k) + 10
+        alpha = max(0.0, RAG_HYBRID_ALPHA - 0.2)
+    else:
+        pool_size = max(RAG_CANDIDATE_POOL_SIZE, top_k)
+        alpha = RAG_HYBRID_ALPHA
 
-    all_hits = sorted(knowledge_hits + history_hits, key=lambda h: h["score"], reverse=True)
+    knowledge_candidates = _hybrid_search(
+        knowledge_collection, query, query_vector, pool_size, effective_project_id, alpha=alpha
+    )
+    history_candidates = _hybrid_search(
+        history_collection, query, query_vector, pool_size, effective_project_id, alpha=alpha
+    )
+    candidates = sorted(knowledge_candidates + history_candidates, key=lambda h: h["score"], reverse=True)
+
+    if not candidates:
+        return {"context_text": "", "sources": []}
+
+    all_hits = rerank_candidates(query, candidates, top_n=top_k)
 
     if not all_hits:
         return {"context_text": "", "sources": []}
@@ -245,7 +435,7 @@ def retrieve_dual_rag_context(query: str, project_id: str = "", top_k: int = RAG
     # khảo nội bộ, đâu là câu hỏi của người dùng.
     context_lines = []
     for idx, h in enumerate(all_hits, start=1):
-        header_parts = [f"Tài liệu {idx}", f"nguồn: {h['source']}", f"độ liên quan: {h['score']:.0%}"]
+        header_parts = [f"Tài liệu {idx}", f"nguồn: {h['source']}", f"độ liên quan: {max(0.0, min(1.0, h['score'])):.0%}"]
         if h.get("incident_name"):
             header_parts.append(f"SỰ CỐ: {h['incident_name']}")
         if h.get("boiler_type_tag") and h["boiler_type_tag"] != "chung":

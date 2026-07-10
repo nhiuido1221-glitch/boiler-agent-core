@@ -210,7 +210,10 @@ def split_by_incident_sections(text: str) -> list[dict]:
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE_WORDS, overlap: int = CHUNK_OVERLAP_WORDS) -> list[str]:
-    """Chia văn bản thành các đoạn ~chunk_size từ, có overlap để không mất ngữ cảnh ở ranh giới."""
+    """Chia văn bản thành các đoạn ~chunk_size từ, có overlap để không mất ngữ cảnh ở ranh giới.
+    Dùng làm PHƯƠNG ÁN DỰ PHÒNG (fallback) cho _prose_chunk() bên dưới, và cho bảng biểu
+    (bảng đã "làm phẳng có kiểm soát" theo hàng nên chia cố định là hợp lý, không cần
+    semantic chunking)."""
     words = text.split()
     if not words:
         return []
@@ -223,6 +226,34 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE_WORDS, overlap: int = CHU
         chunks.append(" ".join(chunk_words))
         start += step
     return chunks
+
+
+def _semantic_embed_fn(texts: list[str]) -> list[list[float]]:
+    """Adapter truyền vào semantic_chunk(): dùng embedding Gemini task_type
+    "SEMANTIC_SIMILARITY" (tối ưu cho so sánh mức độ giống nhau giữa 2 đoạn văn bản,
+    khác với RETRIEVAL_DOCUMENT/RETRIEVAL_QUERY dùng khi tìm kiếm)."""
+    from src.rag_retriever import embed_texts
+
+    return embed_texts(texts, task_type="SEMANTIC_SIMILARITY")
+
+
+def _prose_chunk(text: str) -> list[str]:
+    """
+    Chia văn bản THƯỜNG (không phải bảng biểu) theo NGỮ NGHĨA (semantic chunking,
+    Task 29/33) thay vì cắt cứng theo số từ - giữ đúng ranh giới ý/đoạn thay vì cắt
+    giữa chừng 1 ý đang trình bày dở. Nếu Gemini API lỗi (mất mạng, hết quota...),
+    tự rơi về chunk_text() cố định - KHÔNG được làm sập luồng upload tài liệu vì
+    1 bước tối ưu chất lượng.
+    """
+    try:
+        from src.semantic_chunker import semantic_chunk
+
+        chunks = semantic_chunk(text, embed_fn=_semantic_embed_fn)
+        if chunks:
+            return chunks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lỗi semantic chunking (rơi về chia theo số từ cố định): %s", exc)
+    return chunk_text(text)
 
 
 def _build_chunk_records(text: str, filename: str, table_blocks: Optional[list[dict]] = None) -> list[dict]:
@@ -240,7 +271,7 @@ def _build_chunk_records(text: str, filename: str, table_blocks: Optional[list[d
     if sections:
         logger.info("Phát hiện %s sự cố riêng biệt trong '%s', chia theo cấu trúc.", len(sections), filename)
         for section in sections:
-            for sub_chunk in chunk_text(section["content"]):
+            for sub_chunk in _prose_chunk(section["content"]):
                 labeled_text = f"[SỰ CỐ: {section['heading']}]\n{sub_chunk}"
                 records.append(
                     {
@@ -252,7 +283,7 @@ def _build_chunk_records(text: str, filename: str, table_blocks: Optional[list[d
                 )
     else:
         logger.info("Không phát hiện cấu trúc PHẦN/Mục trong '%s', dùng chia theo số từ cố định.", filename)
-        for chunk in chunk_text(text):
+        for chunk in _prose_chunk(text):
             records.append({"text": chunk, "incident_name": "", "part_name": "", "boiler_type_tag": "chung"})
 
     for table in table_blocks or []:
