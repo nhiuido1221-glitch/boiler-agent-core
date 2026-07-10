@@ -55,7 +55,11 @@ def _get_embedding_model():
         "Đang tải embedding model: %s (lần đầu sẽ tải file model, có thể mất vài chục giây)",
         EMBEDDING_MODEL_NAME,
     )
-    return TextEmbedding(EMBEDDING_MODEL_NAME)
+    # threads=1: giới hạn số luồng nội bộ của onnxruntime. Máy chủ free-tier (vd Render
+    # 512MB RAM, 0.1 CPU) không có nhiều lõi CPU để tận dụng đa luồng, mà mỗi luồng nội
+    # bộ onnxruntime lại tự cấp phát thêm vùng nhớ riêng (arena) - giới hạn còn 1 luồng
+    # giúp giảm đáng kể mức RAM tiêu thụ của model, đổi lại chỉ chậm đi không đáng kể.
+    return TextEmbedding(EMBEDDING_MODEL_NAME, threads=1)
 
 
 @lru_cache(maxsize=1)

@@ -291,7 +291,6 @@ def ingest_document(
     Trả về số lượng chunk đã nạp. Raise exception nếu thất bại - nơi gọi hàm chịu trách
     nhiệm bắt lỗi và báo cụ thể cho người dùng.
     """
-    from fastembed import TextEmbedding
     from qdrant_client import QdrantClient
     from qdrant_client.models import Filter, FieldCondition, MatchValue, PointStruct
 
@@ -316,7 +315,13 @@ def ingest_document(
         raise RuntimeError("QDRANT_URL chưa được cấu hình trong .env")
 
     client = QdrantClient(url=url, api_key=api_key, timeout=60)
-    model = TextEmbedding(model_name)
+    # QUAN TRỌNG (tránh lỗi "Ran out of memory" trên Render free tier 512MB): dùng lại
+    # ĐÚNG 1 bản model embedding đã cache sẵn trong rag_retriever.py, KHÔNG tự tạo bản
+    # mới ở đây. Trước đây mỗi lần upload file sẽ nạp thêm 1 bản ONNX model ~220MB độc
+    # lập, cộng dồn với bản đang cache cho việc trả lời câu hỏi -> tràn RAM.
+    from src.rag_retriever import _get_embedding_model
+
+    model = _get_embedding_model()
 
     uses_e5_prefix = "e5" in model_name.lower()
     texts_to_embed = [f"passage: {r['text']}" if uses_e5_prefix else r["text"] for r in records]
