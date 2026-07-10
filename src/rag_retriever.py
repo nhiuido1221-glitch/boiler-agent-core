@@ -365,34 +365,29 @@ def list_documents(project_id: str) -> dict[str, dict[str, int]]:
     return result
 
 
-def retrieve_dual_rag_context(
+def retrieve_candidates(
     query: str,
     project_id: str = "",
     top_k: int = RAG_TOP_K,
     query_type: str = "general",
-) -> dict:
+) -> list[dict]:
     """
-    Hàm chính: truy hồi song song cả 2 collection (knowledge + history), CHỈ trong
-    phạm vi project_id hiện tại + kho dùng chung, trả về dict gồm text ngữ cảnh đã
-    gộp và danh sách nguồn tham khảo.
+    Bước 1/2 của "Advanced RAG lite": Hybrid search (dense Gemini + sparse BM25,
+    alpha weighting) trên cả 2 collection (knowledge + history), CHỈ trong phạm vi
+    project_id hiện tại + kho dùng chung, trả về 1 pool ỨNG VIÊN RỘNG (chưa rerank).
 
-    Luồng "Advanced RAG lite" (Task 30-33):
-      1) Hybrid search (dense + BM25, alpha weighting) lấy 1 pool ứng viên RỘNG
-         (RAG_CANDIDATE_POOL_SIZE, không phải top_k) từ mỗi collection.
-      2) Rerank (Cohere Rerank API, module reranker.py) chọn lại đúng top_k liên
-         quan nhất trong pool đó - bù cho cả dense lẫn BM25 đều có thể "gần đúng
-         nhưng sai trọng tâm".
-      3) query_type (từ node phân loại câu hỏi trong boiler_graph_builder.py) điều
-         chỉnh pool_size: câu hỏi tra số liệu/bảng biểu (numeric_lookup) cần pool
-         rộng hơn vì dữ liệu thường nằm rải rác ở nhiều dòng bảng khác nhau.
+    Tách riêng khỏi bước rerank (xem reranker.rerank_candidates(), gọi từ node
+    rerank_node riêng trong boiler_graph_builder.py) để rerank là 1 LangGraph Node
+    độc lập, dễ log/theo dõi/tắt riêng nếu Cohere API có sự cố, không ảnh hưởng tới
+    bước truy hồi Qdrant.
 
-    Nếu quá trình embedding hoặc Qdrant lỗi (mất mạng, sai API key, collection chưa
-    được tạo...), trả về context rỗng thay vì raise exception - giữ đúng chuẩn công
-    nghiệp "không được làm sập luồng chính". Tương tự, nếu BM25/rerank lỗi, tự động
-    rơi về kết quả dense-only thay vì crash.
+    query_type ("numeric_lookup" từ query_router_node) mở rộng pool_size và ưu tiên
+    BM25 hơn (alpha thấp hơn) - vì tra số liệu/bảng biểu cần khớp từ khóa/đơn vị
+    chính xác hơn là "hiểu ngữ nghĩa" chung chung.
+
+    Nếu lỗi embedding/Qdrant: trả về [] thay vì raise - giữ chuẩn công nghiệp
+    "không được làm sập luồng chính".
     """
-    from src.reranker import rerank_candidates
-
     knowledge_collection = os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
     history_collection = os.getenv("QDRANT_COLLECTION_HISTORY", "boiler_incident_history")
     effective_project_id = project_id or os.getenv("DEFAULT_PROJECT_ID", "boiler_default")
@@ -401,11 +396,8 @@ def retrieve_dual_rag_context(
         query_vector = embed_query(query)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Lỗi tạo embedding cho RAG, bỏ qua RAG cho request này: %s", exc)
-        return {"context_text": "", "sources": []}
+        return []
 
-    # numeric_lookup (tra bảng/thông số) -> cần pool rộng hơn để không bỏ sót dòng
-    # dữ liệu đúng, và ưu tiên BM25 hơn (alpha thấp hơn) vì tra số liệu cần khớp
-    # từ khóa/đơn vị chính xác hơn là "hiểu ngữ nghĩa" chung chung.
     if query_type == "numeric_lookup":
         pool_size = max(RAG_CANDIDATE_POOL_SIZE, top_k) + 10
         alpha = max(0.0, RAG_HYBRID_ALPHA - 0.2)
@@ -419,13 +411,15 @@ def retrieve_dual_rag_context(
     history_candidates = _hybrid_search(
         history_collection, query, query_vector, pool_size, effective_project_id, alpha=alpha
     )
-    candidates = sorted(knowledge_candidates + history_candidates, key=lambda h: h["score"], reverse=True)
+    return sorted(knowledge_candidates + history_candidates, key=lambda h: h["score"], reverse=True)
 
-    if not candidates:
-        return {"context_text": "", "sources": []}
 
-    all_hits = rerank_candidates(query, candidates, top_n=top_k)
-
+def build_rag_context(all_hits: list[dict]) -> dict:
+    """
+    Bước cuối: từ danh sách hit CUỐI CÙNG (đã rerank hoặc chưa, tuỳ rerank_node có
+    chạy thành công hay không), dựng context_text đánh số + nhãn rõ ràng để đưa vào
+    prompt LLM, và danh sách sources gọn để log/hiển thị.
+    """
     if not all_hits:
         return {"context_text": "", "sources": []}
 
@@ -463,3 +457,26 @@ def retrieve_dual_rag_context(
             for h in all_hits
         ],
     }
+
+
+def retrieve_dual_rag_context(
+    query: str,
+    project_id: str = "",
+    top_k: int = RAG_TOP_K,
+    query_type: str = "general",
+) -> dict:
+    """
+    Wrapper TƯƠNG THÍCH NGƯỢC: gộp retrieve_candidates() + rerank_candidates() +
+    build_rag_context() trong 1 lệnh gọi - dùng cho script/CLI hoặc bất kỳ nơi nào
+    KHÔNG chạy qua LangGraph (nơi rerank là 1 node riêng, xem rerank_node trong
+    boiler_graph_builder.py). Luồng chính (Telegram bot) dùng 2 node tách riêng
+    rag_retrieval_node + rerank_node, KHÔNG gọi hàm này.
+    """
+    from src.reranker import rerank_candidates
+
+    candidates = retrieve_candidates(query, project_id=project_id, top_k=top_k, query_type=query_type)
+    if not candidates:
+        return {"context_text": "", "sources": []}
+
+    all_hits = rerank_candidates(query, candidates, top_n=top_k)
+    return build_rag_context(all_hits)

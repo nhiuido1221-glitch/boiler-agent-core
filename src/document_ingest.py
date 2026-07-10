@@ -390,3 +390,72 @@ def ingest_document(
         project_id,
     )
     return len(points)
+
+
+def ingest_admin_note(note_text: str, project_id: str, collection_name: Optional[str] = None) -> str:
+    """
+    Lệnh "dạy" AI qua Telegram (ADMIN gửi 'LƯU LẠI: <nội dung>' - xem
+    src/telegram_bot.py handle_message). Embed và nạp NGAY 1 đoạn kinh nghiệm thực
+    tế ngắn vào Qdrant collection lịch sử sự cố (history), như 1 chunk độc lập, để
+    lần sau hệ thống trả lời có thể trích dẫn qua RAG.
+
+    Đây là cách "học thêm" khả thi và AN TOÀN nhất cho kiến trúc hiện tại: KHÔNG
+    fine-tune lại model nền (không khả thi/không cần thiết với Groq/Gemini API,
+    tốn kém, rủi ro làm hỏng khả năng tổng quát của model) - chỉ bổ sung TRI THỨC
+    vào kho tham khảo mà AI vẫn LUÔN đọc trước khi trả lời (Hybrid Search + Rerank).
+    Ưu điểm: tức thời (không cần deploy lại), tự nhiên fit vào kiến trúc RAG đã có,
+    và mọi ghi chú admin đều có thể xem lại/kiểm tra qua Qdrant (minh bạch, không
+    phải "hộp đen" như việc chỉnh trọng số model).
+
+    Khác với ingest_document() (xử lý file, nhiều chunk, CÓ xoá chunk cũ cùng tên
+    file để tránh trùng khi nạp lại), đây là 1 đoạn text ngắn độc lập - luôn tạo
+    record MỚI, không có khái niệm "ghi đè" (2 ghi chú khác nhau không liên quan).
+
+    Trả về: id điểm dữ liệu vừa tạo (string UUID) để log/xác nhận với ADMIN.
+    Raise exception nếu lỗi (Qdrant/embedding) - để handle_message báo lỗi cụ thể
+    ngay cho ADMIN thay vì âm thầm mất dữ liệu vừa dạy.
+    """
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import PointStruct
+
+    note_text = note_text.strip()
+    if not note_text:
+        raise ValueError("Ghi chú rỗng, không có nội dung để lưu.")
+
+    url = os.getenv("QDRANT_URL")
+    api_key = os.getenv("QDRANT_API_KEY")
+    collection = collection_name or os.getenv("QDRANT_COLLECTION_HISTORY", "boiler_incident_history")
+    if not url:
+        raise RuntimeError("QDRANT_URL chưa được cấu hình trong .env")
+
+    client = QdrantClient(url=url, api_key=api_key, timeout=30)
+
+    # Gemini, task_type="RETRIEVAL_DOCUMENT" - đây là nội dung được LƯU TRỮ để tìm
+    # kiếm sau này, giống hệt cách ingest_document() xử lý file.
+    from src.rag_retriever import embed_texts
+
+    vector = embed_texts([note_text], task_type="RETRIEVAL_DOCUMENT")[0]
+
+    point_id = str(uuid.uuid4())
+    client.upsert(
+        collection_name=collection,
+        points=[
+            PointStruct(
+                id=point_id,
+                vector=vector,
+                payload={
+                    "text": note_text,
+                    "source": "Ghi chú ADMIN (Telegram - lệnh LƯU LẠI:)",
+                    "project_id": project_id,
+                    "incident_name": "",
+                    "part_name": "",
+                    "boiler_type_tag": "chung",
+                },
+            )
+        ],
+    )
+    logger.info(
+        "Đã lưu 1 ghi chú ADMIN vào collection '%s', project_id='%s', id=%s",
+        collection, project_id, point_id,
+    )
+    return point_id

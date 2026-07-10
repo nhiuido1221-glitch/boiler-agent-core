@@ -31,7 +31,11 @@ class AgentState(TypedDict, total=False):
     # "general" (khai niem/quy trinh, uu tien hieu ngu nghia) ---
     query_type: Literal["numeric_lookup", "general"]
 
-    # --- Ket qua Dual-RAG (Phase 4: rag_retrieval_node, Qdrant) ---
+    # --- Ung vien tho tu Hybrid Search (Task 33: rag_retrieval_node), CHUA rerank -
+    # rerank_node doc rieng field nay, KHONG doc lai Qdrant ---
+    rag_candidates: List[dict]
+
+    # --- Ket qua Dual-RAG sau rerank (Task 31/33: rerank_node) ---
     rag_context: str
     rag_sources: List[dict]
 

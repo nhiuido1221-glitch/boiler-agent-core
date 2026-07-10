@@ -12,11 +12,16 @@ Luồng định tuyến:
       -> vision_analysis_node     (nếu có ảnh đính kèm -> gọi Vision Model phân tích)
       -> query_router_node        (Task 32: phân loại nhẹ "numeric_lookup" vs "general" để
                                     điều chỉnh cách RAG truy hồi bên dưới)
-      -> rag_retrieval_node       (Advanced RAG lite - Task 30/31/33: Hybrid Search (dense
-                                    Gemini + sparse BM25, alpha weighting) lấy pool ứng viên rộng
-                                    từ Qdrant knowledge + history, lọc theo project_id, rồi Rerank
-                                    (Cohere Rerank API) chọn lại top-K liên quan nhất)
-      -> emergency_router_node    (quét từ khóa khẩn cấp trên raw_message + vision_summary)
+      -> rag_retrieval_node       (Task 30/33: Hybrid Search (dense Gemini + sparse BM25, alpha
+                                    weighting) lấy pool ứng viên RỘNG từ Qdrant knowledge + history,
+                                    lọc theo project_id - CHƯA rerank)
+      -> rerank_node               (Task 31/33: gọi Cohere Rerank API chọn lại top-K liên quan
+                                    nhất trong pool, dựng context_text/sources cuối cùng - node
+                                    riêng, có 2 lớp try/except + timeout 20s, không bao giờ treo bot)
+      -> emergency_router_node    (quét từ khóa khẩn cấp trên raw_message + vision_summary - MẶC
+                                    ĐỊNH TẮT từ 2026-07-11 qua EMERGENCY_KEYWORD_GATE_ENABLED=false,
+                                    vì khớp chuỗi con thô gây báo động giả trên câu hỏi thông tin
+                                    thông thường; bật lại bằng 1 biến môi trường khi cần)
       -> post_rule_layer_edge     (conditional: emergency > standard)
            -> emergency_handler_node  (ưu tiên tuyệt đối, phản hồi tức thì không qua LLM)
            -> standard_llm_node       (Groq LLM + Dual-RAG context, áp dụng cho MỌI role)
@@ -65,6 +70,19 @@ logger = logging.getLogger("boiler_graph_builder")
 # CẤU HÌNH RULE LAYER
 # ==============================================================================
 MAX_LOOP_COUNT = int(os.getenv("MAX_LOOP_COUNT", "3"))
+
+# Task (phản hồi anh Long 2026-07-11): cơ chế quét từ khóa đang quá "ngáo" - khớp
+# CHUỖI CON thô, không phân biệt được câu hỏi thông tin ("tại sao lò bị MẤT NƯỚC")
+# với báo cáo sự cố thật ("lò đang MẤT NƯỚC, cần xử lý gấp"), nên cứ thấy từ khóa
+# là bắn cảnh báo khẩn cấp - gây phiền, làm giảm lòng tin vào cảnh báo thật. Theo
+# yêu cầu, TẮT hẳn lớp chặn cứng này (route thẳng qua standard_llm_node, LLM vẫn
+# có đủ ngữ cảnh RAG + system prompt để tự nhắc nhở an toàn khi cần, chỉ là không
+# còn kiểu chặn cứng bằng khớp từ khóa). Giữ nguyên toàn bộ code/luồng graph phía
+# dưới để khi cần bật lại (có thể nâng cấp thêm điều kiện ngữ cảnh, không chỉ
+# khớp từ khóa thô), chỉ cần đổi biến môi trường này, KHÔNG cần sửa code.
+EMERGENCY_KEYWORD_GATE_ENABLED = os.getenv("EMERGENCY_KEYWORD_GATE_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 EMERGENCY_KEYWORDS = [
     "tut ap",
@@ -252,11 +270,16 @@ def query_router_node(state: AgentState) -> AgentState:
 
 def rag_retrieval_node(state: AgentState) -> AgentState:
     """
-    Dual-RAG: truy hồi Qdrant (knowledge base + incident history), CHỈ trong
-    phạm vi project_id của request hiện tại (+ kho dùng chung), dựa trên nội
-    dung tin nhắn (gộp cả kết quả phân tích ảnh nếu có) để làm ngữ cảnh cho
-    standard_llm_node. Nếu Qdrant lỗi/chưa cấu hình, trả về context rỗng -
-    không làm fail request chính (fail-soft).
+    Hybrid Search (Task 30/33): truy hồi Qdrant (knowledge base + incident history)
+    bằng dense (Gemini) + sparse (BM25) kết hợp, CHỈ trong phạm vi project_id của
+    request hiện tại (+ kho dùng chung), dựa trên nội dung tin nhắn (gộp cả kết quả
+    phân tích ảnh nếu có). Trả về 1 pool ỨNG VIÊN RỘNG, CHƯA rerank - bước rerank
+    tách riêng thành rerank_node (Task 33 - anh Long yêu cầu tách Node riêng để dễ
+    theo dõi/tắt riêng nếu Cohere API có sự cố).
+
+    Nếu Qdrant/embedding lỗi/chưa cấu hình: trả về danh sách ứng viên rỗng - không
+    làm fail request chính (fail-soft), rerank_node/standard_llm_node vẫn chạy tiếp
+    bình thường, chỉ là không có ngữ cảnh RAG.
     """
     raw_message = state.get("raw_message", "")
     vision_summary = state.get("vision_summary", "")
@@ -265,30 +288,93 @@ def rag_retrieval_node(state: AgentState) -> AgentState:
 
     if not combined_query:
         return {
-            "rag_context": "",
-            "rag_sources": [],
+            "rag_candidates": [],
             "routing_log": ["[rag_retrieval_node] Không có nội dung để truy hồi."],
         }
 
     try:
-        from src.rag_retriever import retrieve_dual_rag_context
+        from src.rag_retriever import retrieve_candidates
 
         query_type = state.get("query_type", "general")
-        result = retrieve_dual_rag_context(combined_query, project_id=project_id, query_type=query_type)
-        log_line = f"[rag_retrieval_node] project_id={project_id} tìm thấy {len(result['sources'])} nguồn tham khảo"
+        candidates = retrieve_candidates(combined_query, project_id=project_id, query_type=query_type)
+        log_line = f"[rag_retrieval_node] project_id={project_id} pool={len(candidates)} ứng viên (chưa rerank)"
+        logger.info(log_line)
+        return {
+            "rag_candidates": candidates,
+            "routing_log": [log_line],
+        }
+    except Exception as exc:  # noqa: BLE001 - RAG là tầng bổ trợ, không được làm fail request
+        logger.warning("[rag_retrieval_node] Lỗi Hybrid Search, tiếp tục không có ứng viên: %s", exc)
+        return {
+            "rag_candidates": [],
+            "routing_log": [f"[rag_retrieval_node] LỖI (bỏ qua): {exc}"],
+        }
+
+
+def rerank_node(state: AgentState) -> AgentState:
+    """
+    Rerank (Task 31/33 - BẮT BUỘC theo yêu cầu anh Long): nhận pool ứng viên rộng từ
+    rag_retrieval_node, gọi Cohere Rerank API (module src/reranker.py) để chọn lại
+    top_k liên quan nhất, rồi dựng context_text/sources cuối cùng cho standard_llm_node.
+
+    Node RIÊNG (không gộp vào rag_retrieval_node) để: (1) dễ log/theo dõi/đo thời
+    gian riêng bước rerank, (2) nếu Cohere API timeout/lỗi, chỉ node này bị ảnh
+    hưởng - rag_retrieval_node đã lấy xong ứng viên từ Qdrant, không phải gọi lại.
+
+    BẢO VỆ CHỐNG TREO BOT: rerank_candidates() nội bộ đã bọc httpx.Client(timeout=20)
+    + try/except (rơi về giữ nguyên điểm hybrid nếu lỗi). Ở ĐÂY bọc thêm 1 lớp
+    try/except NGOÀI CÙNG nữa (phòng lỗi import/dữ liệu bất thường ngoài phạm vi
+    gọi API) - đảm bảo TUYỆT ĐỐI không có tình huống nào khiến node này crash và
+    làm treo toàn bộ luồng xử lý tin nhắn Telegram.
+    """
+    candidates = state.get("rag_candidates", [])
+    if not candidates:
+        return {
+            "rag_context": "",
+            "rag_sources": [],
+            "routing_log": ["[rerank_node] Không có ứng viên để rerank."],
+        }
+
+    raw_message = state.get("raw_message", "")
+    vision_summary = state.get("vision_summary", "")
+    combined_query = f"{raw_message} {vision_summary}".strip()
+    top_k = int(os.getenv("RAG_TOP_K", "5"))
+
+    try:
+        from src.reranker import rerank_candidates
+        from src.rag_retriever import build_rag_context
+
+        all_hits = rerank_candidates(combined_query, candidates, top_n=top_k)
+        result = build_rag_context(all_hits)
+        log_line = f"[rerank_node] {len(candidates)} ứng viên -> {len(all_hits)} sau rerank"
         logger.info(log_line)
         return {
             "rag_context": result["context_text"],
             "rag_sources": result["sources"],
             "routing_log": [log_line],
         }
-    except Exception as exc:  # noqa: BLE001 - RAG là tầng bổ trợ, không được làm fail request
-        logger.warning("[rag_retrieval_node] Lỗi Dual-RAG, tiếp tục không có ngữ cảnh: %s", exc)
-        return {
-            "rag_context": "",
-            "rag_sources": [],
-            "routing_log": [f"[rag_retrieval_node] LỖI (bỏ qua): {exc}"],
-        }
+    except Exception as exc:  # noqa: BLE001 - rerank là tầng bổ trợ, KHÔNG được treo/fail bot
+        logger.warning(
+            "[rerank_node] Lỗi rerank (rơi về dùng nguyên pool ứng viên theo điểm hybrid, "
+            "không sập luồng): %s", exc,
+        )
+        try:
+            from src.rag_retriever import build_rag_context
+
+            fallback_hits = sorted(candidates, key=lambda h: h.get("score", 0.0), reverse=True)[:top_k]
+            result = build_rag_context(fallback_hits)
+            return {
+                "rag_context": result["context_text"],
+                "rag_sources": result["sources"],
+                "routing_log": [f"[rerank_node] LỖI rerank, dùng fallback hybrid: {exc}"],
+            }
+        except Exception as exc2:  # noqa: BLE001 - lớp bảo vệ cuối cùng, tuyệt đối không crash
+            logger.error("[rerank_node] Lỗi cả fallback (bỏ qua RAG hoàn toàn): %s", exc2)
+            return {
+                "rag_context": "",
+                "rag_sources": [],
+                "routing_log": [f"[rerank_node] LỖI cả fallback: {exc2}"],
+            }
 
 
 def emergency_router_node(state: AgentState) -> AgentState:
@@ -299,6 +385,15 @@ def emergency_router_node(state: AgentState) -> AgentState:
     hệ thống cũng tự động kích hoạt khẩn cấp kể cả khi người dùng không gõ từ
     khóa đó. Áp dụng cho MỌI role, kể cả ADMIN - an toàn không có ngoại lệ.
     """
+    if not EMERGENCY_KEYWORD_GATE_ENABLED:
+        log_line = "[emergency_router_node] Lớp chặn từ khóa khẩn cấp đang TẮT (EMERGENCY_KEYWORD_GATE_ENABLED=false) - bỏ qua, đi tiếp standard_llm_node."
+        logger.info(log_line)
+        return {
+            "is_emergency": False,
+            "keywords_found": [],
+            "routing_log": [log_line],
+        }
+
     combined_text = _normalize(state.get("raw_message", "") + " " + state.get("vision_summary", ""))
     found = [kw for kw in EMERGENCY_KEYWORDS if _normalize(kw) in combined_text]
     is_emergency = len(found) > 0
@@ -553,6 +648,7 @@ def build_graph():
     graph.add_node("vision_analysis_node", vision_analysis_node)
     graph.add_node("query_router_node", query_router_node)
     graph.add_node("rag_retrieval_node", rag_retrieval_node)
+    graph.add_node("rerank_node", rerank_node)
     graph.add_node("emergency_router_node", emergency_router_node)
     graph.add_node("emergency_handler_node", emergency_handler_node)
     graph.add_node("standard_llm_node", standard_llm_node)
@@ -574,7 +670,8 @@ def build_graph():
     # Vision -> Dual-RAG -> Emergency Router (chuỗi tuần tự, không điều kiện)
     graph.add_edge("vision_analysis_node", "query_router_node")
     graph.add_edge("query_router_node", "rag_retrieval_node")
-    graph.add_edge("rag_retrieval_node", "emergency_router_node")
+    graph.add_edge("rag_retrieval_node", "rerank_node")
+    graph.add_edge("rerank_node", "emergency_router_node")
 
     # Sau Rule Layer: Emergency ưu tiên tuyệt đối, còn lại (mọi role) -> standard_llm_node
     graph.add_conditional_edges(

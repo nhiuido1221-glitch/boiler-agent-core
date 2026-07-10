@@ -45,6 +45,10 @@ from typing import Optional
 logger = logging.getLogger("telegram_bot")
 
 ADMIN_ID = os.getenv("ADMIN_ID", "")
+
+# Lệnh "dạy" AI qua Telegram (chỉ ADMIN) - chấp nhận vài biến thể gõ (có/không dấu)
+# để không đòi hỏi anh Long phải gõ chính xác 100% có dấu mỗi lần.
+ADMIN_TEACH_PREFIXES = ("lưu lại:", "luu lai:", "ghi nhớ:", "ghi nho:")
 RETRY_SLEEP_SECONDS = 5
 MAX_UPLOAD_SIZE_BYTES = 20 * 1024 * 1024  # 20MB, khớp giới hạn Telegram Bot API cho getFile
 GROUP_COMMAND_PREFIX = "/hoi"  # từ khóa gọi bot trong group chat, tránh spam
@@ -470,6 +474,42 @@ def _build_bot(compiled_graph):
             from src.project_registry import get_project_id_for_group
 
             project_id = get_project_id_for_group(group_id)
+
+            # Lệnh "dạy" AI (ADMIN only): 'LƯU LẠI: <nội dung kinh nghiệm>' - lưu thẳng
+            # vào kho lịch sử sự cố qua RAG, KHÔNG đi qua LangGraph (đây là ghi dữ liệu,
+            # không phải câu hỏi). Chỉ ADMIN mới được dùng - tránh OPERATOR/GUEST vô tình
+            # (hoặc cố ý) ghi sai thông tin vào kho tham khảo chung, làm nhiễu RAG cho cả
+            # nhà máy về sau (rủi ro dữ liệu, không phải rủi ro bảo mật, nhưng hậu quả vận
+            # hành tương đương - 1 ghi chú sai có thể khiến AI tư vấn sai cho người khác).
+            teach_prefix = next(
+                (p for p in ADMIN_TEACH_PREFIXES if raw_text.strip().lower().startswith(p)), None
+            )
+            if teach_prefix is not None:
+                if user_role != "ADMIN":
+                    bot.reply_to(message, "⛔ Chỉ ADMIN (Kỹ sư Long) mới được dùng lệnh dạy 'LƯU LẠI:'.")
+                    return
+                note_text = raw_text.strip()[len(teach_prefix):].strip()
+                if not note_text:
+                    bot.reply_to(
+                        message,
+                        "Cú pháp: LƯU LẠI: <nội dung kinh nghiệm cần ghi nhớ>\n"
+                        "Ví dụ: LƯU LẠI: sự cố lớp liệu quá dày ở ghi 2 >>> giảm Pause 10%, tăng gió cấp 1.",
+                    )
+                    return
+                try:
+                    from src.document_ingest import ingest_admin_note
+
+                    point_id = ingest_admin_note(note_text, project_id=project_id)
+                    logger.info("[handle_message] ADMIN đã dạy 1 ghi chú, id=%s, project_id=%s", point_id, project_id)
+                    bot.reply_to(
+                        message,
+                        "✅ Đã lưu vào kho kinh nghiệm nội bộ. Lần sau có câu hỏi liên quan, "
+                        "hệ thống sẽ tự trích dẫn ghi chú này.",
+                    )
+                except Exception as exc:  # noqa: BLE001 - không được để lệnh dạy làm chết bot
+                    logger.exception("[handle_message] Lỗi lưu ghi chú ADMIN: %s", exc)
+                    bot.reply_to(message, f"❌ Lưu ghi chú thất bại: {exc}\nVui lòng thử lại.")
+                return
 
             initial_state = {
                 "raw_message": raw_text,
