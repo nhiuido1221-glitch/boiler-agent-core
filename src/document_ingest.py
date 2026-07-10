@@ -309,28 +309,23 @@ def ingest_document(
     url = os.getenv("QDRANT_URL")
     api_key = os.getenv("QDRANT_API_KEY")
     collection = collection_name or os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
-    model_name = os.getenv("QDRANT_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
     if not url:
         raise RuntimeError("QDRANT_URL chưa được cấu hình trong .env")
 
     client = QdrantClient(url=url, api_key=api_key, timeout=60)
-    # QUAN TRỌNG (tránh lỗi "Ran out of memory" trên Render free tier 512MB): dùng lại
-    # ĐÚNG 1 bản model embedding đã cache sẵn trong rag_retriever.py, KHÔNG tự tạo bản
-    # mới ở đây. Trước đây mỗi lần upload file sẽ nạp thêm 1 bản ONNX model ~220MB độc
-    # lập, cộng dồn với bản đang cache cho việc trả lời câu hỏi -> tràn RAM.
-    from src.rag_retriever import _get_embedding_model
+    # Dùng Gemini API để sinh embedding (KHÔNG chạy model tại chỗ nữa) - tránh hẳn lỗi
+    # "Ran out of memory" trên Render free tier 512MB. task_type="RETRIEVAL_DOCUMENT" vì
+    # đây là nội dung được LƯU TRỮ để tìm kiếm sau này (khác với câu hỏi truy vấn).
+    from src.rag_retriever import embed_texts
 
-    model = _get_embedding_model()
-
-    uses_e5_prefix = "e5" in model_name.lower()
-    texts_to_embed = [f"passage: {r['text']}" if uses_e5_prefix else r["text"] for r in records]
-    vectors = list(model.embed(texts_to_embed))
+    texts_to_embed = [r["text"] for r in records]
+    vectors = embed_texts(texts_to_embed, task_type="RETRIEVAL_DOCUMENT")
 
     points = [
         PointStruct(
             id=str(uuid.uuid4()),
-            vector=vector.tolist(),
+            vector=vector,
             payload={
                 "text": record["text"],
                 "source": filename,

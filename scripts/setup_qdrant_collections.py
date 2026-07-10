@@ -12,11 +12,12 @@ src/rag_retriever.py).
 Chạy: python scripts/setup_qdrant_collections.py
 (Yêu cầu đã cài dependencies và điền đủ .env)
 
-Vector size = 384 vì dùng model embedding mặc định
-"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (nhẹ ~220MB,
-đủ hỗ trợ tiếng Việt, tránh lỗi "bad allocation" của model multilingual-e5-large
-2.24GB trên máy cấu hình thường). Nếu đổi model embedding khác có số chiều
-khác, script này sẽ TỰ PHÁT HIỆN và xoá + tạo lại collection cho khớp.
+Vector size = 768: dùng Gemini API (model "gemini-embedding-001", output_dimensionality=768)
+thay vì chạy model embedding tại chỗ - tránh lỗi "Ran out of memory" trên máy chủ giới
+hạn RAM thấp (vd Render free/Starter 512MB), vì không còn phải tải/chạy onnxruntime nữa.
+Nếu đổi GEMINI_EMBEDDING_DIM sang số chiều khác, script này sẽ TỰ PHÁT HIỆN và xoá + tạo
+lại collection cho khớp (LƯU Ý: xoá sạch dữ liệu cũ trong collection đó, phải nạp lại
+tài liệu từ đầu sau khi đổi số chiều).
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VECTOR_SIZE = 384
+VECTOR_SIZE = int(os.getenv("GEMINI_EMBEDDING_DIM", "768"))
 
 
 def _get_existing_vector_size(client, name: str) -> Optional[int]:

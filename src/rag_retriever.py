@@ -14,10 +14,16 @@ hiện tại HOẶC được gắn project_id = SHARED_PROJECT_ID (kho dùng chu
 đảm bảo tài liệu của dự án A không lẫn sang dự án B, trong khi tài liệu
 dùng chung (quy chuẩn kỹ thuật tổng quát) vẫn được mọi dự án tham khảo.
 
-Embedding: dùng fastembed (thư viện chính chủ của Qdrant, chạy ONNX local,
-KHÔNG cần gọi API ngoài, KHÔNG cần thêm API key). Model mặc định:
-"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" (384 chiều, ~220MB,
-nhẹ, tránh lỗi "bad allocation" khi load model). Hỗ trợ tiếng Việt tốt.
+Embedding: gọi API ngoài Google Gemini (model "gemini-embedding-001", REST endpoint
+batchEmbedContents, 768 chiều) thay vì chạy model tại chỗ. Lý do đổi: chạy embedding
+local (fastembed/onnxruntime) tốn RAM quá lớn so với giới hạn 512MB của gói máy chủ
+miễn phí (Render free/Starter), từng gây crash "Ran out of memory" giữa lúc xử lý câu
+hỏi. Gọi API ngoài giúp giải phóng hoàn toàn RAM đó, đổi lại cần 1 API key miễn phí của
+Google (GEMINI_API_KEY, lấy tại https://aistudio.google.com/apikey, gói free: 100
+request/phút, 1000 request/ngày - dư sức cho quy mô dùng nội bộ 1 nhà máy). Dùng đúng
+task_type cho từng chiều: "RETRIEVAL_DOCUMENT" khi nạp tài liệu, "RETRIEVAL_QUERY" khi
+tìm kiếm theo câu hỏi - giúp độ chính xác tốt hơn hẳn so với kiểu tiền tố "query:"/
+"passage:" thủ công của các model cũ.
 
 Nguyên tắc công nghiệp: nếu Qdrant không kết nối được, KHÔNG được làm sập
 luồng xử lý chính - trả về context rỗng và log cảnh báo, để hệ thống vẫn
@@ -32,34 +38,72 @@ from typing import Optional
 
 logger = logging.getLogger("rag_retriever")
 
-EMBEDDING_MODEL_NAME = os.getenv(
-    "QDRANT_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+GEMINI_EMBEDDING_DIM = int(os.getenv("GEMINI_EMBEDDING_DIM", "768"))
+GEMINI_EMBED_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_EMBEDDING_MODEL}:batchEmbedContents"
 )
-# Chỉ model dòng E5 (intfloat/*-e5-*) mới cần tiền tố "query: "/"passage: ". Model
-# hiện tại (MiniLM multilingual) KHÔNG dùng quy ước này - thêm vào sẽ làm giảm chất lượng.
-USES_E5_PREFIX = "e5" in EMBEDDING_MODEL_NAME.lower()
+# Gộp nhiều đoạn văn bản vào 1 lần gọi HTTP (batch) để tiết kiệm số request/ngày của
+# gói free (1000 RPD) - giới hạn an toàn dưới mức tối đa không công bố của API.
+GEMINI_BATCH_SIZE = 90
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SCORE_THRESHOLD = float(os.getenv("RAG_SCORE_THRESHOLD", "0.3"))
 SHARED_PROJECT_ID = os.getenv("SHARED_KNOWLEDGE_TAG", "shared")
 
 
-@lru_cache(maxsize=1)
-def _get_embedding_model():
+def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
     """
-    Khởi tạo model embedding 1 lần duy nhất (lru_cache) vì load model tốn
-    vài giây - không được load lại mỗi request.
-    """
-    from fastembed import TextEmbedding
+    Gọi Gemini API (batchEmbedContents) để sinh embedding cho 1 danh sách văn bản
+    trong ít lượt gọi HTTP nhất có thể (gộp theo GEMINI_BATCH_SIZE). Dùng chung cho
+    cả nạp tài liệu (task_type="RETRIEVAL_DOCUMENT") lẫn tìm kiếm theo câu hỏi
+    (task_type="RETRIEVAL_QUERY") - Gemini tối ưu vector khác nhau cho từng vai trò
+    này, chính xác hơn hẳn so với dùng chung 1 kiểu embedding cho cả 2 phía.
 
-    logger.info(
-        "Đang tải embedding model: %s (lần đầu sẽ tải file model, có thể mất vài chục giây)",
-        EMBEDDING_MODEL_NAME,
-    )
-    # threads=1: giới hạn số luồng nội bộ của onnxruntime. Máy chủ free-tier (vd Render
-    # 512MB RAM, 0.1 CPU) không có nhiều lõi CPU để tận dụng đa luồng, mà mỗi luồng nội
-    # bộ onnxruntime lại tự cấp phát thêm vùng nhớ riêng (arena) - giới hạn còn 1 luồng
-    # giúp giảm đáng kể mức RAM tiêu thụ của model, đổi lại chỉ chậm đi không đáng kể.
-    return TextEmbedding(EMBEDDING_MODEL_NAME, threads=1)
+    gemini-embedding-001 mặc định trả 3072 chiều đã chuẩn hoá sẵn; khi dùng
+    output_dimensionality nhỏ hơn (768, để nhẹ Qdrant hơn) PHẢI tự chuẩn hoá lại
+    (chia cho độ dài vector) - API không tự làm việc này cho model 001 (chỉ model 002
+    trở lên mới tự động).
+    """
+    import httpx
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY chưa được cấu hình trong .env")
+
+    all_vectors: list[list[float]] = []
+    with httpx.Client(timeout=60) as client:
+        for i in range(0, len(texts), GEMINI_BATCH_SIZE):
+            batch = texts[i : i + GEMINI_BATCH_SIZE]
+            payload = {
+                "requests": [
+                    {
+                        "model": f"models/{GEMINI_EMBEDDING_MODEL}",
+                        "content": {"parts": [{"text": t}]},
+                        "taskType": task_type,
+                        "output_dimensionality": GEMINI_EMBEDDING_DIM,
+                    }
+                    for t in batch
+                ]
+            }
+            response = client.post(
+                GEMINI_EMBED_URL,
+                headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            for emb in data.get("embeddings", []):
+                values = emb.get("values", [])
+                norm = sum(v * v for v in values) ** 0.5
+                if norm > 0:
+                    values = [v / norm for v in values]
+                all_vectors.append(values)
+
+    if len(all_vectors) != len(texts):
+        raise RuntimeError(
+            f"Gemini API trả về {len(all_vectors)} vector nhưng gửi đi {len(texts)} đoạn văn bản - không khớp."
+        )
+    return all_vectors
 
 
 @lru_cache(maxsize=1)
@@ -74,15 +118,8 @@ def _get_qdrant_client():
 
 
 def embed_query(text: str) -> list[float]:
-    """
-    Sinh vector embedding cho 1 câu truy vấn. Chỉ thêm tiền tố "query: " nếu đang
-    dùng model dòng E5 (đúng quy ước của E5) - model mặc định hiện tại (MiniLM
-    multilingual) không cần và không nên thêm tiền tố này.
-    """
-    model = _get_embedding_model()
-    text_to_embed = f"query: {text}" if USES_E5_PREFIX else text
-    vector = next(model.embed([text_to_embed]))
-    return vector.tolist()
+    """Sinh vector embedding cho 1 câu truy vấn (task_type="RETRIEVAL_QUERY")."""
+    return embed_texts([text], task_type="RETRIEVAL_QUERY")[0]
 
 
 def _build_project_filter(project_id: str):

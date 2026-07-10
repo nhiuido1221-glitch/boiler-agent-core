@@ -38,16 +38,16 @@ SAMPLE_DOCUMENTS = [
 
 
 def main() -> int:
-    from fastembed import TextEmbedding
+    # Thêm sys.path để import được src.rag_retriever khi chạy script này trực tiếp
+    # (python scripts/seed_knowledge_example.py) từ thư mục gốc dự án.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from qdrant_client import QdrantClient
     from qdrant_client.models import PointStruct
+    from src.rag_retriever import embed_texts
 
     url = os.getenv("QDRANT_URL")
     api_key = os.getenv("QDRANT_API_KEY")
     collection = os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
-    model_name = os.getenv(
-        "QDRANT_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    )
     shared_tag = os.getenv("SHARED_KNOWLEDGE_TAG", "shared")
 
     if not url:
@@ -55,18 +55,13 @@ def main() -> int:
         return 1
 
     client = QdrantClient(url=url, api_key=api_key, timeout=30)
-    model = TextEmbedding(model_name)
-
-    # Chỉ model dòng E5 mới cần tiền tố "passage: " - model mặc định hiện tại (MiniLM
-    # multilingual) không dùng quy ước này.
-    uses_e5_prefix = "e5" in model_name.lower()
-    prefixed_docs = [f"passage: {doc}" if uses_e5_prefix else doc for doc in SAMPLE_DOCUMENTS]
-    vectors = list(model.embed(prefixed_docs))
+    # task_type="RETRIEVAL_DOCUMENT" vì đây là nội dung được lưu trữ để tìm kiếm sau này.
+    vectors = embed_texts(SAMPLE_DOCUMENTS, task_type="RETRIEVAL_DOCUMENT")
 
     points = [
         PointStruct(
             id=str(uuid.uuid4()),
-            vector=vector.tolist(),
+            vector=vector,
             payload={
                 "text": doc,
                 "source": "SOP_mau",
