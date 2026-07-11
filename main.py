@@ -97,6 +97,10 @@ def _resolve_role(payload: InvokeRequest) -> str:
 
 
 @app.get("/health")
+@app.head("/health")  # HEAD: mot so dich vu keep-alive (UptimeRobot,
+# cron-job.org...) mac dinh gui HEAD chu khong phai GET - truoc day thieu
+# route nay nen bi tra ve 405 lien tuc (thay trong log that), lam sai lech
+# ket qua giam sat uptime du server van chay binh thuong.
 def health_check() -> dict[str, Any]:
     return {
         "status": "ok" if compiled_graph is not None else "degraded",

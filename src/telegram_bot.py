@@ -107,12 +107,53 @@ def _split_long_message(text: str, max_chars: int = TELEGRAM_MAX_MESSAGE_CHARS) 
     return [f"[{idx}/{total}]\n{part}" if total > 1 else part for idx, part in enumerate(parts, start=1)]
 
 
-def _send_long_reply(bot, message, text: str) -> None:
-    """Gửi trả lời có thể dài hơn giới hạn Telegram - tự tách thành nhiều tin nhắn liên tiếp."""
+def _send_long_reply(bot, message, text: str, max_retry: int = 3) -> None:
+    """
+    Gửi trả lời có thể dài hơn giới hạn Telegram - tự tách thành nhiều tin
+    nhắn liên tiếp.
+
+    Nguyên nhân sự cố "bot im lặng không trả lời" (đã xác nhận qua log Render
+    thật): pyTelegramBotAPI KHÔNG có timeout mặc định cho các lệnh gửi tin
+    (reply_to/send_message) - nếu mạng tới api.telegram.org chập chờn tạm
+    thời, lệnh gửi treo VÔ THỜI HẠN, không raise lỗi, nên try/except bên
+    ngoài không bao giờ được kích hoạt để báo lỗi hay thử lại. Đã vá 2 lớp:
+      1) Timeout toàn cục cho MỌI lệnh gọi Telegram API (xem apihelper.
+         CONNECT_TIMEOUT/READ_TIMEOUT được set 1 lần lúc khởi tạo bot trong
+         _build_bot()) - biến "treo vĩnh viễn" thành "báo lỗi có giới hạn
+         thời gian", đúng chuẩn công nghiệp bắt buộc của dự án.
+      2) Retry + sleep ngay tại đây (giống mẫu đã dùng cho Groq/Gemini) - 1
+         lần chập chờn thoáng qua sẽ tự phục hồi, không cần Kỹ sư Long phải
+         gửi lại tin nhắn.
+    """
     chunks = _split_long_message(text)
-    bot.reply_to(message, chunks[0])
+
+    def _send_one(chunk: str, is_first: bool) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, max_retry + 1):
+            try:
+                if is_first:
+                    bot.reply_to(message, chunk)
+                else:
+                    bot.send_message(message.chat.id, chunk)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "[_send_long_reply] Lỗi gửi Telegram lần %s/%s: %s. Thử lại sau %ss.",
+                    attempt, max_retry, exc, RETRY_SLEEP_SECONDS,
+                )
+                if attempt < max_retry:
+                    time.sleep(RETRY_SLEEP_SECONDS)
+        logger.error(
+            "[_send_long_reply] Gửi thất bại sau %s lần thử (chat_id=%s): %s",
+            max_retry, getattr(message.chat, "id", "?"), last_error,
+        )
+
+    _send_one(chunks[0], is_first=True)
     for chunk in chunks[1:]:
-        bot.send_message(message.chat.id, chunk)
+        _send_one(chunk, is_first=False)
+
+
 
 
 def _extract_image_urls(bot, message) -> list[str]:
@@ -149,7 +190,21 @@ def _parse_group_command(text: str, bot_username: str) -> tuple[bool, str]:
 
 def _build_bot(compiled_graph):
     import telebot
-    from telebot import types
+    from telebot import types, apihelper
+
+    # FIX SU CO "BOT IM LANG KHONG TRA LOI" (xac nhan qua log Render that:
+    # request toi Supabase thanh cong, nhung sau do khong co gi - khong loi,
+    # khong phan hoi, treo vo thoi han). Nguyen nhan: pyTelegramBotAPI khong
+    # co timeout mac dinh cho cac lenh GOI RA (reply_to/send_message/get_file/
+    # get_me...) - 1 lan mang chap chon toi api.telegram.org la treo thread xu
+    # ly tin nhan do mai mai, try/except ben ngoai khong bao gio duoc kich
+    # hoat vi khong co exception nao duoc raise ra de bat. Set timeout toan
+    # cuc o day ap dung cho MOI lenh goi Telegram API trong suot vong doi bot,
+    # bien "treo vinh vien" thanh "bao loi co gioi han thoi gian" - dung
+    # nguyen tac cong nghiep bat buoc cua du an (khong duoc im lang khi mat
+    # mang tam thoi).
+    apihelper.CONNECT_TIMEOUT = 15
+    apihelper.READ_TIMEOUT = 20
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token or token.startswith("xxxxxx"):
