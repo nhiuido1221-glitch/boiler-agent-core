@@ -107,6 +107,25 @@ GEMINI_RETRY_MAX_SECONDS = float(os.getenv("GEMINI_RETRY_MAX_SECONDS", "30"))
 GEMINI_INTER_BATCH_SLEEP_SECONDS = float(os.getenv("GEMINI_INTER_BATCH_SLEEP_SECONDS", "0.5"))
 
 
+# Phát hiện thực tế (2026-07-11, qua trang Rate Limit của Google AI Studio): dashboard
+# cho thấy RPD (request/ngày) của gemini-embedding-001 đã ở mức 915/1000 (91.5%) - GẦN
+# CẠN QUOTA CẢ NGÀY, không chỉ là giới hạn phút thoáng qua. Trong tình huống này, cứ
+# RETRY theo phút (như logic cũ) sẽ KHÔNG BAO GIỜ thành công trong ngày hôm đó, mà còn
+# tự làm cạn quota nhanh hơn - MỖI LẦN retry, dù thất bại, VẪN TÍNH vào RPD. Vì vậy khi
+# phát hiện dấu hiệu lỗi liên quan tới quota NGÀY (đọc trong nội dung lỗi trả về, tìm
+# các từ khóa như "PerDay"/"per day"/"daily"), DỪNG NGAY, không retry thêm - báo lỗi rõ
+# ràng để không lãng phí phần quota ít ỏi còn lại trong ngày.
+_DAILY_QUOTA_HINTS = ("perday", "per day", "daily", "requestsperday")
+
+
+def _looks_like_daily_quota_exhausted(response) -> bool:
+    try:
+        body_text = response.text.lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(hint in body_text for hint in _DAILY_QUOTA_HINTS)
+
+
 def _post_with_retry(client, url: str, headers: dict, payload: dict):
     """
     Gọi POST tới Gemini API, tự retry với exponential backoff khi gặp lỗi TẠM THỜI:
@@ -114,6 +133,10 @@ def _post_with_retry(client, url: str, headers: dict, payload: dict):
     xác hơn đoán mò) hoặc 5xx (lỗi phía Google, thường tự hết). KHÔNG retry với lỗi
     4xx khác (400 sai payload, 401/403 sai API key, 404 sai model...) - những lỗi này
     retry cũng vô ích, chỉ tổ chờ lâu hơn trước khi báo lỗi thật cho người dùng.
+
+    Riêng 429 do CẠN QUOTA NGÀY (RPD) - phát hiện qua nội dung lỗi trả về - dừng NGAY,
+    không retry: retry trong trường hợp này chắc chắn thất bại (quota chỉ reset sau 1
+    ngày) và mỗi lần thử vẫn tính vào quota, càng làm cạn thêm phần còn lại trong ngày.
     """
     import httpx
 
@@ -122,10 +145,16 @@ def _post_with_retry(client, url: str, headers: dict, payload: dict):
         try:
             response = client.post(url, headers=headers, json=payload)
             if response.status_code == 429 or response.status_code >= 500:
+                if response.status_code == 429 and _looks_like_daily_quota_exhausted(response):
+                    logger.error(
+                        "Gemini API báo cạn QUOTA NGÀY (RPD) - dừng thử lại ngay để không lãng phí "
+                        "phần quota còn lại của hôm nay. Chi tiết: %s", response.text[:300],
+                    )
+                    response.raise_for_status()
                 if attempt == GEMINI_MAX_RETRIES:
                     logger.error(
-                        "Gemini API vẫn lỗi %s sau %s lần thử - báo lỗi thật, không thử lại nữa.",
-                        response.status_code, GEMINI_MAX_RETRIES,
+                        "Gemini API vẫn lỗi %s sau %s lần thử - báo lỗi thật, không thử lại nữa. Chi tiết: %s",
+                        response.status_code, GEMINI_MAX_RETRIES, response.text[:300],
                     )
                     response.raise_for_status()
                 retry_after = response.headers.get("Retry-After")
