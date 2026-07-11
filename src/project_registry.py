@@ -145,3 +145,37 @@ def get_boiler_type_for_group(group_id: str) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Không tra cứu được boiler_type cho group_id=%s: %s", group_id, exc)
         return ""
+
+
+def get_project_group_ids(project_id: str) -> list[str]:
+    """
+    Liệt kê TẤT CẢ group_id đang gán vào project_id này - thường chỉ 1 nhóm, nhưng
+    schema cho phép nhiều nhóm Telegram khác nhau cùng gán vào 1 project_id, nên phải
+    liệt kê đủ trước khi xoá dự án (không được bỏ sót nhóm nào).
+    """
+    try:
+        client = _get_supabase_client()
+        response = client.table(TABLE_NAME).select("group_id").eq("project_id", project_id).execute()
+        return [row["group_id"] for row in (response.data or [])]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không liệt kê được group_id cho project_id=%s: %s", project_id, exc)
+        return []
+
+
+def delete_project_mapping(project_id: str) -> int:
+    """
+    Xoá TOÀN BỘ bản ghi Supabase (mọi group_id) đang gán vào project_id này. Dùng cho
+    lệnh /delete_project (Telegram, chỉ ADMIN). KHÔNG đụng tới dữ liệu Qdrant - xem
+    src/rag_retriever.py delete_project_chunks() cho phần đó, gọi riêng từ nơi khác.
+
+    Trả về số bản ghi đã xoá (0 nếu lỗi hoặc không có gì để xoá).
+    """
+    try:
+        client = _get_supabase_client()
+        response = client.table(TABLE_NAME).delete().eq("project_id", project_id).execute()
+        deleted_count = len(response.data or [])
+        logger.critical("Đã xoá %s bản ghi Supabase (group_id) gán với project_id='%s'.", deleted_count, project_id)
+        return deleted_count
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Lỗi xoá bản ghi Supabase cho project_id=%s: %s", project_id, exc)
+        return 0

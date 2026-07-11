@@ -480,3 +480,71 @@ def retrieve_dual_rag_context(
 
     all_hits = rerank_candidates(query, candidates, top_n=top_k)
     return build_rag_context(all_hits)
+
+
+def count_project_chunks(project_id: str) -> dict[str, int]:
+    """
+    Đếm số chunk (KHÔNG kèm kho dùng chung, CHỈ đúng project_id này) trong cả 2
+    collection - dùng để hiện số liệu cảnh báo trước khi ADMIN xác nhận xoá dự án
+    qua lệnh /delete_project (Telegram). Khác với list_documents()/_build_project_filter
+    (vốn OR thêm cả SHARED_PROJECT_ID cho mục đích truy hồi) - ở đây PHẢI đếm CHÍNH XÁC
+    riêng project_id, không được lẫn số liệu của kho dùng chung.
+    """
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    knowledge_collection = os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
+    history_collection = os.getenv("QDRANT_COLLECTION_HISTORY", "boiler_incident_history")
+    client = _get_qdrant_client()
+    exact_filter = Filter(must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))])
+
+    counts: dict[str, int] = {}
+    for label, collection_name in (("knowledge", knowledge_collection), ("history", history_collection)):
+        try:
+            result = client.count(collection_name=collection_name, count_filter=exact_filter, exact=True)
+            counts[label] = result.count
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Không đếm được chunk collection '%s' cho project_id='%s': %s", collection_name, project_id, exc)
+            counts[label] = 0
+    return counts
+
+
+def delete_project_chunks(project_id: str) -> dict[str, int]:
+    """
+    XOÁ VĨNH VIỄN toàn bộ chunk gắn ĐÚNG project_id này khỏi cả 2 collection Qdrant.
+    Dùng cho lệnh /delete_project (Telegram, chỉ ADMIN, có xác nhận qua nút bấm trước
+    khi gọi hàm này - xem src/telegram_bot.py).
+
+    BẢO VỆ CỨNG: từ chối tuyệt đối nếu project_id == SHARED_PROJECT_ID - đây là kho
+    dùng chung cho MỌI dự án, xoá nhầm sẽ xoá tri thức của toàn bộ nhà máy chứ không
+    riêng 1 dự án. Raise ValueError thay vì âm thầm bỏ qua, để lỗi này KHÔNG BAO GIỜ
+    lọt qua được kể cả khi có bug ở tầng gọi hàm.
+    """
+    if project_id == SHARED_PROJECT_ID:
+        raise ValueError(
+            f"TỪ CHỐI: '{project_id}' là kho DÙNG CHUNG, không được xoá qua lệnh xoá dự án."
+        )
+    if not project_id.strip():
+        raise ValueError("project_id rỗng - từ chối xoá để tránh xoá nhầm toàn bộ collection.")
+
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+    knowledge_collection = os.getenv("QDRANT_COLLECTION_KNOWLEDGE", "boiler_knowledge_base")
+    history_collection = os.getenv("QDRANT_COLLECTION_HISTORY", "boiler_incident_history")
+    client = _get_qdrant_client()
+    exact_filter = Filter(must=[FieldCondition(key="project_id", match=MatchValue(value=project_id))])
+
+    before_counts = count_project_chunks(project_id)
+
+    deleted: dict[str, int] = {}
+    for label, collection_name in (("knowledge", knowledge_collection), ("history", history_collection)):
+        try:
+            client.delete(collection_name=collection_name, points_selector=exact_filter)
+            deleted[label] = before_counts.get(label, 0)
+            logger.critical(
+                "Đã XOÁ VĨNH VIỄN %s chunk của project_id='%s' trong collection '%s'.",
+                deleted[label], project_id, collection_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Lỗi xoá chunk project_id='%s' trong collection '%s': %s", project_id, collection_name, exc)
+            deleted[label] = 0
+    return deleted

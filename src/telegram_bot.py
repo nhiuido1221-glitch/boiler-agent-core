@@ -62,6 +62,13 @@ _bot_thread: Optional[threading.Thread] = None
 _pending_uploads: dict[str, dict] = {}
 _pending_uploads_lock = threading.Lock()
 
+# Lưu tạm dự án đang chờ ADMIN XÁC NHẬN xoá (qua nút bấm) - /delete_project là thao
+# tác PHÁ HUỶ DỮ LIỆU VĨNH VIỄN nên bắt buộc phải qua bước xác nhận riêng, không xoá
+# ngay khi gõ lệnh. Mất khi bot khởi động lại (an toàn hơn: 1 phiên xác nhận "treo"
+# quá lâu qua nhiều lần restart không nên còn hiệu lực).
+_pending_deletes: dict[str, dict] = {}
+_pending_deletes_lock = threading.Lock()
+
 
 def _resolve_role(telegram_user_id: str) -> str:
     """ADMIN chỉ được cấp khi telegram_user_id khớp chính xác ADMIN_ID cấu hình."""
@@ -174,7 +181,9 @@ def _build_bot(compiled_graph):
             "thay vì nói chung chung.\n"
             "• /my_project - xem group này đang thuộc dự án nào, loại lò gì.\n"
             "• /list_docs - xem danh sách tài liệu đã nạp cho dự án này.\n"
-            "• Gửi file .txt/.pdf/.docx - (ADMIN) nạp tài liệu vào kho kiến thức.",
+            "• Gửi file .txt/.pdf/.docx - (ADMIN) nạp tài liệu vào kho kiến thức.\n"
+            "• LƯU LẠI: <nội dung> - (ADMIN) dạy AI 1 kinh nghiệm thực tế, lưu ngay vào kho.\n"
+            "• /delete_project <mã> - (ADMIN) XOÁ VĨNH VIỄN 1 dự án (cả tài liệu), có xác nhận qua nút bấm.",
         )
 
     # --------------------------------------------------------------------
@@ -317,6 +326,138 @@ def _build_bot(compiled_graph):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Lỗi xử lý /list_docs: %s", exc)
             bot.reply_to(message, f"❌ Lỗi khi lấy danh sách tài liệu: {exc}")
+
+    # --------------------------------------------------------------------
+    # Xoá dự án (chỉ ADMIN) - PHÁ HUỶ DỮ LIỆU VĨNH VIỄN, bắt buộc xác nhận qua nút bấm
+    # --------------------------------------------------------------------
+    @bot.message_handler(commands=["delete_project"])
+    def handle_delete_project(message):
+        try:
+            telegram_user_id = str(message.from_user.id) if message.from_user else ""
+            if _resolve_role(telegram_user_id) != "ADMIN":
+                bot.reply_to(message, "Chỉ ADMIN mới được xoá dự án.")
+                return
+
+            parts = (message.text or "").split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                bot.reply_to(message, "Cú pháp: /delete_project <ma_du_an>\nVí dụ: /delete_project nhamay_binhduong")
+                return
+
+            target_project_id = parts[1].strip()
+
+            from src.project_registry import SHARED_PROJECT_ID
+
+            if target_project_id == SHARED_PROJECT_ID:
+                bot.reply_to(
+                    message,
+                    f"⛔ '{target_project_id}' là kho DÙNG CHUNG cho mọi dự án, không thể xoá qua lệnh này.",
+                )
+                return
+
+            from src.project_registry import get_project_group_ids
+            from src.rag_retriever import count_project_chunks
+
+            group_ids = get_project_group_ids(target_project_id)
+            counts = count_project_chunks(target_project_id)
+            total_chunks = counts.get("knowledge", 0) + counts.get("history", 0)
+
+            if not group_ids and total_chunks == 0:
+                bot.reply_to(message, f"Không tìm thấy dữ liệu nào cho mã dự án '{target_project_id}'.")
+                return
+
+            delete_id = uuid.uuid4().hex[:16]
+            with _pending_deletes_lock:
+                _pending_deletes[delete_id] = {
+                    "project_id": target_project_id,
+                    "telegram_user_id": telegram_user_id,
+                }
+
+            markup = types.InlineKeyboardMarkup()
+            markup.add(
+                types.InlineKeyboardButton(
+                    "🗑️ XÁC NHẬN XOÁ VĨNH VIỄN", callback_data=f"delproj:{delete_id}"
+                )
+            )
+            markup.add(types.InlineKeyboardButton("❌ Huỷ", callback_data=f"delcancel:{delete_id}"))
+
+            bot.reply_to(
+                message,
+                f"⚠️ SẮP XOÁ VĨNH VIỄN dự án '{target_project_id}':\n"
+                f"• {len(group_ids)} nhóm Telegram đang gán vào dự án này sẽ bị gỡ liên kết.\n"
+                f"• {counts.get('knowledge', 0)} đoạn tài liệu kỹ thuật + {counts.get('history', 0)} đoạn "
+                f"lịch sử sự cố ({total_chunks} tổng) sẽ bị XOÁ KHỎI KHO, KHÔNG THỂ KHÔI PHỤC.\n\n"
+                "Bấm nút bên dưới để xác nhận, hoặc bỏ qua tin nhắn này để huỷ.",
+                reply_markup=markup,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Lỗi xử lý /delete_project: %s", exc)
+            bot.reply_to(message, f"❌ Đã xảy ra lỗi khi xử lý lệnh: {exc}")
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(("delproj:", "delcancel:")))
+    def handle_delete_project_choice(call):
+        try:
+            action, delete_id = call.data.split(":", 1)
+
+            if action == "delcancel":
+                with _pending_deletes_lock:
+                    _pending_deletes.pop(delete_id, None)
+                bot.answer_callback_query(call.id, "Đã huỷ.")
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id, message_id=call.message.message_id, text="Đã huỷ xoá dự án."
+                )
+                return
+
+            with _pending_deletes_lock:
+                info = _pending_deletes.pop(delete_id, None)
+
+            if not info:
+                bot.answer_callback_query(call.id, "Phiên xác nhận đã hết hạn (bot có thể đã khởi động lại). Gõ lại lệnh.")
+                return
+
+            if _resolve_role(info["telegram_user_id"]) != "ADMIN":
+                bot.answer_callback_query(call.id, "Chỉ ADMIN mới được thao tác.")
+                return
+
+            target_project_id = info["project_id"]
+            bot.answer_callback_query(call.id, "Đang xoá...")
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"⏳ Đang xoá vĩnh viễn dự án '{target_project_id}'...",
+            )
+
+            from src.project_registry import delete_project_mapping
+            from src.rag_retriever import delete_project_chunks
+
+            deleted_chunks = delete_project_chunks(target_project_id)
+            deleted_groups = delete_project_mapping(target_project_id)
+
+            total_deleted = deleted_chunks.get("knowledge", 0) + deleted_chunks.get("history", 0)
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=(
+                    f"✅ Đã xoá vĩnh viễn dự án '{target_project_id}': "
+                    f"{total_deleted} đoạn tài liệu ({deleted_chunks.get('knowledge', 0)} kiến thức + "
+                    f"{deleted_chunks.get('history', 0)} lịch sử sự cố), gỡ liên kết {deleted_groups} nhóm."
+                ),
+            )
+            logger.critical(
+                "ADMIN %s đã xoá dự án '%s': %s chunk, %s nhóm.",
+                info["telegram_user_id"], target_project_id, total_deleted, deleted_groups,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Lỗi xử lý callback xoá dự án: %s", exc)
+            error_text = f"❌ Lỗi khi xoá dự án: {exc}"
+            try:
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id, message_id=call.message.message_id, text=error_text
+                )
+            except Exception:  # noqa: BLE001
+                try:
+                    bot.answer_callback_query(call.id, error_text[:200])
+                except Exception:  # noqa: BLE001
+                    pass
 
     # --------------------------------------------------------------------
     # Upload tài liệu (chỉ ADMIN) - hỏi lại bằng nút bấm thay vì cần caption
