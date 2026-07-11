@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from functools import lru_cache
 from typing import Optional
 
@@ -82,6 +83,66 @@ def _tokenize(text: str) -> list[str]:
     return _TOKEN_RE.findall(text.lower())
 
 
+# Lỗi thực tế gặp trên production (2026-07-11): "429 Too Many Requests" khi nạp tài
+# liệu - nguyên nhân là gói free Gemini giới hạn 100 request/phút, trong khi 1 lần
+# nạp tài liệu có cấu trúc nhiều PHẦN/Mục sẽ gọi Gemini NHIỀU LẦN (mỗi section 1 lần
+# cho semantic chunking + 1 lần cuối để embed toàn bộ chunk) - dồn dập trong vài giây
+# dễ vượt ngưỡng, nhất là khi có thêm lưu lượng hỏi-đáp RAG chạy song song. Trước đây
+# hàm này KHÔNG có cơ chế retry - gặp 429 là raise ngay, làm fail cả lần upload dù
+# đây chỉ là giới hạn TẠM THỜI (thường tự hết sau vài giây). Đúng theo nguyên tắc công
+# nghiệp bắt buộc (mọi lệnh gọi mạng phải tự retry khi lỗi tạm thời) - đã thêm
+# exponential backoff retry riêng cho 429/5xx bên dưới.
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+GEMINI_RETRY_BASE_SECONDS = float(os.getenv("GEMINI_RETRY_BASE_SECONDS", "2"))
+
+
+def _post_with_retry(client, url: str, headers: dict, payload: dict):
+    """
+    Gọi POST tới Gemini API, tự retry với exponential backoff khi gặp lỗi TẠM THỜI:
+    429 (rate limit - ưu tiên đọc header "Retry-After" nếu Gemini có trả về, chính
+    xác hơn đoán mò) hoặc 5xx (lỗi phía Google, thường tự hết). KHÔNG retry với lỗi
+    4xx khác (400 sai payload, 401/403 sai API key, 404 sai model...) - những lỗi này
+    retry cũng vô ích, chỉ tổ chờ lâu hơn trước khi báo lỗi thật cho người dùng.
+    """
+    import httpx
+
+    last_exc: Exception | None = None
+    for attempt in range(1, GEMINI_MAX_RETRIES + 1):
+        try:
+            response = client.post(url, headers=headers, json=payload)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == GEMINI_MAX_RETRIES:
+                    logger.error(
+                        "Gemini API vẫn lỗi %s sau %s lần thử - báo lỗi thật, không thử lại nữa.",
+                        response.status_code, GEMINI_MAX_RETRIES,
+                    )
+                    response.raise_for_status()
+                retry_after = response.headers.get("Retry-After")
+                sleep_seconds = float(retry_after) if retry_after else GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "Gemini API trả về %s (lần thử %s/%s) - ngủ %.1fs rồi thử lại.",
+                    response.status_code, attempt, GEMINI_MAX_RETRIES, sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
+            response.raise_for_status()
+            return response
+        except httpx.TransportError as exc:  # noqa: BLE001 - mất mạng/timeout, cũng nên retry
+            last_exc = exc
+            sleep_seconds = GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "Lỗi mạng gọi Gemini API (lần thử %s/%s): %s - ngủ %.1fs rồi thử lại.",
+                attempt, GEMINI_MAX_RETRIES, exc, sleep_seconds,
+            )
+            if attempt == GEMINI_MAX_RETRIES:
+                raise
+            time.sleep(sleep_seconds)
+
+    if last_exc:  # pragma: no cover - phòng hờ, logic trên đã raise/return hết các nhánh
+        raise last_exc
+    raise RuntimeError("Gemini API: hết số lần thử lại mà không rõ nguyên nhân.")
+
+
 def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
     """
     Gọi Gemini API (batchEmbedContents) để sinh embedding cho 1 danh sách văn bản
@@ -94,6 +155,9 @@ def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list
     output_dimensionality nhỏ hơn (768, để nhẹ Qdrant hơn) PHẢI tự chuẩn hoá lại
     (chia cho độ dài vector) - API không tự làm việc này cho model 001 (chỉ model 002
     trở lên mới tự động).
+
+    Tự động retry (exponential backoff) khi gặp 429/5xx/lỗi mạng tạm thời - xem
+    _post_with_retry() ở trên. Chỉ raise thật khi đã thử hết GEMINI_MAX_RETRIES lần.
     """
     import httpx
 
@@ -115,12 +179,12 @@ def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list
                     for t in batch
                 ]
             }
-            response = client.post(
+            response = _post_with_retry(
+                client,
                 GEMINI_EMBED_URL,
                 headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
-                json=payload,
+                payload=payload,
             )
-            response.raise_for_status()
             data = response.json()
             for emb in data.get("embeddings", []):
                 values = emb.get("values", [])
