@@ -179,3 +179,24 @@ def delete_project_mapping(project_id: str) -> int:
     except Exception as exc:  # noqa: BLE001
         logger.error("Lỗi xoá bản ghi Supabase cho project_id=%s: %s", project_id, exc)
         return 0
+
+
+def list_all_projects() -> list[dict]:
+    """
+    Liệt kê TOÀN BỘ dự án đã khởi tạo (mọi nhóm Telegram), dùng cho:
+    1) Lệnh /list_projects (Telegram, ADMIN) - xem tổng quan mọi dự án từ bất kỳ đâu,
+       không cần vào từng nhóm.
+    2) Luồng upload tài liệu (handle_document_upload) - cho ADMIN CHỌN THẲNG dự án
+       đích khi upload từ chat riêng, không cần đứng trong đúng nhóm Telegram đó.
+
+    Sắp xếp theo project_name để hiển thị dễ tìm. Trả về [] nếu lỗi/rỗng - không
+    raise, để không làm crash luồng gọi (fail-soft theo chuẩn công nghiệp).
+    """
+    try:
+        client = _get_supabase_client()
+        response = client.table(TABLE_NAME).select("*").execute()
+        rows = response.data or []
+        return sorted(rows, key=lambda r: (r.get("project_name") or r.get("project_id") or ""))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Không liệt kê được danh sách dự án: %s", exc)
+        return []

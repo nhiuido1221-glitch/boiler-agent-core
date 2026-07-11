@@ -180,8 +180,12 @@ def _build_bot(compiled_graph):
             "dự án (vd: 'Lò hơi ống lửa 10 tấn/h đốt trấu'), để AI trả lời đúng loại thiết bị "
             "thay vì nói chung chung.\n"
             "• /my_project - xem group này đang thuộc dự án nào, loại lò gì.\n"
-            "• /list_docs - xem danh sách tài liệu đã nạp cho dự án này.\n"
-            "• Gửi file .txt/.pdf/.docx - (ADMIN) nạp tài liệu vào kho kiến thức.\n"
+            "• /list_projects - (ADMIN) xem TOÀN BỘ dự án đã khởi tạo, gọi được từ chat riêng, "
+            "không cần vào từng nhóm.\n"
+            "• /list_docs [mã dự án] - xem danh sách tài liệu; không gõ mã thì mặc định là dự án "
+            "của group đang chat, gõ thêm mã (vd '/list_docs nhamay_binhduong') để xem dự án khác.\n"
+            "• Gửi file .txt/.pdf/.docx - (ADMIN) nạp tài liệu; bot cho chọn NƠI LƯU bằng nút bấm, "
+            "kể cả từ chat riêng cũng chọn được thẳng dự án mong muốn, không cần vào đúng nhóm đó.\n"
             "• LƯU LẠI: <nội dung> - (ADMIN) dạy AI 1 kinh nghiệm thực tế, lưu ngay vào kho.\n"
             "• /delete_project <mã> - (ADMIN) XOÁ VĨNH VIỄN 1 dự án (cả tài liệu), có xác nhận qua nút bấm.",
         )
@@ -297,11 +301,19 @@ def _build_bot(compiled_graph):
     @bot.message_handler(commands=["list_docs"])
     def handle_list_docs(message):
         try:
-            group_id = str(message.chat.id)
+            # Cho phép xem tài liệu của BẤT KỲ dự án nào bằng cách gõ thêm mã dự án
+            # (vd "/list_docs nhamay_binhduong") - không cần đứng trong đúng nhóm đó.
+            # Không truyền gì thì vẫn mặc định là dự án của group đang chat như cũ.
+            parts = (message.text or "").split(maxsplit=1)
+            explicit_project_id = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
 
-            from src.project_registry import get_project_id_for_group
+            if explicit_project_id:
+                project_id = explicit_project_id
+            else:
+                group_id = str(message.chat.id)
+                from src.project_registry import get_project_id_for_group
 
-            project_id = get_project_id_for_group(group_id)
+                project_id = get_project_id_for_group(group_id)
 
             from src.rag_retriever import list_documents
 
@@ -326,6 +338,45 @@ def _build_bot(compiled_graph):
         except Exception as exc:  # noqa: BLE001
             logger.exception("Lỗi xử lý /list_docs: %s", exc)
             bot.reply_to(message, f"❌ Lỗi khi lấy danh sách tài liệu: {exc}")
+
+    @bot.message_handler(commands=["list_projects"])
+    def handle_list_projects(message):
+        """
+        Liệt kê TOÀN BỘ dự án đã khởi tạo (mọi nhóm), gọi được từ BẤT KỲ ĐÂU (kể cả
+        chat riêng) - không cần đứng trong đúng nhóm Telegram của dự án đó. Chỉ ADMIN
+        xem được: danh sách này lộ ra tên/mã của MỌI nhóm/nhà máy đang dùng hệ thống,
+        thành viên nhóm A không nên biết nhóm B/C/D nào đang tồn tại.
+        """
+        try:
+            telegram_user_id = str(message.from_user.id) if message.from_user else ""
+            if _resolve_role(telegram_user_id) != "ADMIN":
+                bot.reply_to(message, "Chỉ ADMIN mới xem được danh sách toàn bộ dự án.")
+                return
+
+            from src.project_registry import list_all_projects
+
+            projects = list_all_projects()
+            if not projects:
+                bot.reply_to(
+                    message,
+                    "Chưa có dự án nào được khởi tạo. Dùng /new_project <mã> <Tên dự án> "
+                    "trong 1 nhóm Telegram để tạo dự án đầu tiên.",
+                )
+                return
+
+            lines = [f"📋 Danh sách {len(projects)} dự án đã khởi tạo:"]
+            for p in projects:
+                boiler_type = p.get("boiler_type") or "(chưa khai báo)"
+                lines.append(
+                    f"\n• {p.get('project_name') or '(chưa đặt tên)'}"
+                    f"\n  Mã: {p.get('project_id')} | Nhóm: {p.get('group_id')} | Loại lò: {boiler_type}"
+                )
+            lines.append("\n📌 Ngoài ra luôn có 'Kho DÙNG CHUNG' (mã: shared) - tài liệu áp dụng cho mọi dự án.")
+
+            _send_long_reply(bot, message, "".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Lỗi xử lý /list_projects: %s", exc)
+            bot.reply_to(message, f"❌ Đã xảy ra lỗi khi xử lý lệnh: {exc}")
 
     # --------------------------------------------------------------------
     # Xoá dự án (chỉ ADMIN) - PHÁ HUỶ DỮ LIỆU VĨNH VIỄN, bắt buộc xác nhận qua nút bấm
@@ -489,6 +540,19 @@ def _build_bot(compiled_graph):
                 bot.reply_to(message, f"❌ Định dạng '.{ext}' chưa hỗ trợ. Chỉ hỗ trợ: .txt, .pdf, .docx")
                 return
 
+            from src.project_registry import get_project_id_for_group, list_all_projects
+
+            current_project = get_project_id_for_group(str(message.chat.id))
+
+            # Cho ADMIN chọn THẲNG bất kỳ dự án nào đã khởi tạo, không chỉ dự án của
+            # đúng nhóm đang chat - để upload được từ chat riêng mà không cần vào tận
+            # nhóm Telegram của dự án đó. Loại bỏ dự án trùng với "dự án hiện tại"
+            # (đã có nút riêng) để không hiện 2 nút giống nhau. Giới hạn số nút hiển thị
+            # để bàn phím không quá dài (Telegram không giới hạn cứng nhưng UX sẽ tệ).
+            all_projects = list_all_projects()
+            other_projects_full = [p for p in all_projects if p.get("project_id") != current_project]
+            other_projects = other_projects_full[:15]
+
             upload_id = uuid.uuid4().hex[:16]
             with _pending_uploads_lock:
                 _pending_uploads[upload_id] = {
@@ -496,11 +560,8 @@ def _build_bot(compiled_graph):
                     "filename": filename,
                     "group_id": str(message.chat.id),
                     "telegram_user_id": telegram_user_id,
+                    "projects": other_projects,
                 }
-
-            from src.project_registry import get_project_id_for_group
-
-            current_project = get_project_id_for_group(str(message.chat.id))
 
             markup = types.InlineKeyboardMarkup()
             markup.add(
@@ -513,9 +574,17 @@ def _build_bot(compiled_graph):
                     f"📁 Dự án hiện tại ({current_project})", callback_data=f"kbproject:{upload_id}"
                 )
             )
+            for idx, proj in enumerate(other_projects):
+                label = f"📂 {proj.get('project_name') or proj.get('project_id')} ({proj.get('project_id')})"
+                markup.add(types.InlineKeyboardButton(label, callback_data=f"kbpick:{upload_id}:{idx}"))
+
+            extra_note = ""
+            if len(other_projects_full) > len(other_projects):
+                extra_note = "\n(Còn nhiều dự án khác chưa hiện hết - dùng /list_projects để xem đủ danh sách.)"
+
             bot.reply_to(
                 message,
-                f"📄 Đã nhận file '{filename}'. Chọn nơi lưu tài liệu:",
+                f"📄 Đã nhận file '{filename}'. Chọn nơi lưu tài liệu:{extra_note}",
                 reply_markup=markup,
             )
         except Exception as exc:  # noqa: BLE001
@@ -525,10 +594,14 @@ def _build_bot(compiled_graph):
             except Exception:  # noqa: BLE001
                 pass
 
-    @bot.callback_query_handler(func=lambda call: call.data.startswith(("kbshared:", "kbproject:")))
+    @bot.callback_query_handler(func=lambda call: call.data.startswith(("kbshared:", "kbproject:", "kbpick:")))
     def handle_upload_choice(call):
         try:
-            scope, upload_id = call.data.split(":", 1)
+            parts = call.data.split(":")
+            scope = parts[0]
+            upload_id = parts[1]
+            pick_index = int(parts[2]) if scope == "kbpick" and len(parts) > 2 else None
+
             with _pending_uploads_lock:
                 info = _pending_uploads.pop(upload_id, None)
 
@@ -558,6 +631,18 @@ def _build_bot(compiled_graph):
             if scope == "kbshared":
                 target_project_id = SHARED_PROJECT_ID
                 scope_label = "kho DÙNG CHUNG"
+            elif scope == "kbpick":
+                projects = info.get("projects") or []
+                if pick_index is None or not (0 <= pick_index < len(projects)):
+                    bot.edit_message_text(
+                        chat_id=call.message.chat.id,
+                        message_id=call.message.message_id,
+                        text="❌ Lựa chọn dự án không còn hợp lệ (danh sách có thể đã thay đổi). Gửi lại file.",
+                    )
+                    return
+                picked = projects[pick_index]
+                target_project_id = picked.get("project_id")
+                scope_label = f"dự án '{picked.get('project_name') or target_project_id}' ({target_project_id})"
             else:
                 target_project_id = get_project_id_for_group(info["group_id"])
                 scope_label = f"dự án '{target_project_id}'"
