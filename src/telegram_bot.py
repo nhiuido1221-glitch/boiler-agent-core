@@ -622,7 +622,11 @@ def _build_bot(compiled_graph):
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text=f"⏳ Đang nạp '{info['filename']}'... (thường mất 10-30 giây, vui lòng đợi)",
+                text=(
+                    f"⏳ Đang nạp '{info['filename']}'... (thường mất 10-30 giây; tài liệu lớn/nhiều "
+                    "bảng biểu có thể mất tới vài phút nếu gặp giới hạn tốc độ tạm thời từ Gemini - "
+                    "hệ thống sẽ tự thử lại, không cần gửi lại file, cứ đợi tin nhắn kết quả)"
+                ),
             )
 
             from src.document_ingest import ingest_document

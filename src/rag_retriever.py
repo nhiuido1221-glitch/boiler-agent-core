@@ -92,8 +92,19 @@ def _tokenize(text: str) -> list[str]:
 # đây chỉ là giới hạn TẠM THỜI (thường tự hết sau vài giây). Đúng theo nguyên tắc công
 # nghiệp bắt buộc (mọi lệnh gọi mạng phải tự retry khi lỗi tạm thời) - đã thêm
 # exponential backoff retry riêng cho 429/5xx bên dưới.
-GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "5"))
+# Nâng cấp (2026-07-11, sau khi thấy log thật): tài liệu lớn (vd 1100KB, 28 bảng biểu)
+# có thể khiến Gemini bị giới hạn LIÊN TỤC hơn 60 giây (không phải chỉ 1 đợt ngắn) -
+# ngân sách 5 lần thử/~32s cũ không đủ, tăng lên 8 lần + trần backoff 30s/lần để tổng
+# thời gian chờ tối đa đủ vượt qua cả những đợt giới hạn kéo dài hơn 1 phút.
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "8"))
 GEMINI_RETRY_BASE_SECONDS = float(os.getenv("GEMINI_RETRY_BASE_SECONDS", "2"))
+GEMINI_RETRY_MAX_SECONDS = float(os.getenv("GEMINI_RETRY_MAX_SECONDS", "30"))
+# Nghỉ 1 khoảng NHỎ giữa các lượt gọi batch trong CÙNG 1 lần nạp tài liệu - tài liệu
+# nhiều chunk sẽ tự bắn nhiều request liên tiếp cực nhanh, dễ TỰ GÂY RA 429 (vượt
+# 100 request/phút) hơn là do trùng với traffic bên ngoài. Giãn nhịp chủ động giúp ở
+# lại dưới ngưỡng thay vì phải retry-sau-khi-đã-bị-chặn (retry vẫn tốn thời gian hơn
+# so với tránh bị chặn ngay từ đầu).
+GEMINI_INTER_BATCH_SLEEP_SECONDS = float(os.getenv("GEMINI_INTER_BATCH_SLEEP_SECONDS", "0.5"))
 
 
 def _post_with_retry(client, url: str, headers: dict, payload: dict):
@@ -118,7 +129,10 @@ def _post_with_retry(client, url: str, headers: dict, payload: dict):
                     )
                     response.raise_for_status()
                 retry_after = response.headers.get("Retry-After")
-                sleep_seconds = float(retry_after) if retry_after else GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+                sleep_seconds = (
+                    float(retry_after) if retry_after
+                    else min(GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), GEMINI_RETRY_MAX_SECONDS)
+                )
                 logger.warning(
                     "Gemini API trả về %s (lần thử %s/%s) - ngủ %.1fs rồi thử lại.",
                     response.status_code, attempt, GEMINI_MAX_RETRIES, sleep_seconds,
@@ -129,7 +143,7 @@ def _post_with_retry(client, url: str, headers: dict, payload: dict):
             return response
         except httpx.TransportError as exc:  # noqa: BLE001 - mất mạng/timeout, cũng nên retry
             last_exc = exc
-            sleep_seconds = GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            sleep_seconds = min(GEMINI_RETRY_BASE_SECONDS * (2 ** (attempt - 1)), GEMINI_RETRY_MAX_SECONDS)
             logger.warning(
                 "Lỗi mạng gọi Gemini API (lần thử %s/%s): %s - ngủ %.1fs rồi thử lại.",
                 attempt, GEMINI_MAX_RETRIES, exc, sleep_seconds,
@@ -166,7 +180,11 @@ def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list
 
     all_vectors: list[list[float]] = []
     with httpx.Client(timeout=60) as client:
-        for i in range(0, len(texts), GEMINI_BATCH_SIZE):
+        for batch_num, i in enumerate(range(0, len(texts), GEMINI_BATCH_SIZE)):
+            if batch_num > 0:
+                # Giãn nhịp chủ động TRƯỚC mỗi batch (trừ batch đầu) - xem giải thích ở
+                # GEMINI_INTER_BATCH_SLEEP_SECONDS phía trên.
+                time.sleep(GEMINI_INTER_BATCH_SLEEP_SECONDS)
             batch = texts[i : i + GEMINI_BATCH_SIZE]
             payload = {
                 "requests": [
