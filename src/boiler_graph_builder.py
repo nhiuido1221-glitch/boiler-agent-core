@@ -427,107 +427,167 @@ def emergency_handler_node(state: AgentState) -> AgentState:
     }
 
 
+def _build_boiler_system_prompt(boiler_type: str, is_admin: bool) -> str:
+    """
+    Dựng System Prompt cho standard_llm_node.
+
+    Mỗi khối bên dưới ép LLM vào một khuôn tư duy cụ thể:
+      - "BẠN LÀ AI" ép model nhận vai kỹ sư trưởng vận hành (không phải chatbot
+        chung chung) -> giọng văn, mức độ tự tin, và từ vựng chuyên ngành đúng
+        ngữ cảnh nhà máy nhiệt/lò hơi.
+      - "NGUYÊN TẮC CHỐNG BỊA ĐẶT" là hàng rào cứng: buộc model đối chiếu MỌI
+        câu trả lời với đúng nguyên văn tài liệu RAG, cấm dùng kiến thức nền
+        để "đoán" khi tài liệu không phủ tới - đây là điểm khác biệt lớn nhất
+        so với prompt cũ (trước đây cho phép model tự bổ sung kiến thức chung
+        kèm cảnh báo; giờ ép TỪ CHỐI hẳn bằng đúng 1 câu cố định, an toàn hơn
+        cho môi trường vận hành thực tế nhưng đồng nghĩa bot sẽ từ chối nhiều
+        câu hỏi khái niệm chung nếu tài liệu chưa có - đánh đổi có chủ đích).
+      - "CẢNH GIÁC VỚI SỰ CỐ CÓ TRIỆU CHỨNG GIỐNG NHAU" giữ nguyên từ bản cũ,
+        chống việc model gọi sai tên sự cố chỉ vì triệu chứng bề ngoài trùng.
+      - "CẤU TRÚC CÂU TRẢ LỜI BẮT BUỘC" chỉ kích hoạt cho câu hỏi kiểu sự cố/
+        hiện tượng bất thường (không ép câu hỏi khái niệm/tra cứu đơn giản
+        vào khuôn 3 phần, tránh trả lời máy móc không cần thiết).
+      - "PHONG CÁCH TRẢ LỜI" giữ nguyên lệnh cấm Markdown - bắt buộc phải giữ,
+        vì Telegram hiển thị ký hiệu Markdown thô, mất nếu bỏ đi.
+      - "RÀNG BUỘC AN TOÀN BỔ SUNG" là lưới an toàn cuối: cấm đoán số liệu an
+        toàn quan trọng, ưu tiên khuyến nghị thận trọng khi thiếu căn cứ.
+    """
+    base_prompt = """BẠN LÀ AI:
+Bạn là Kỹ sư trưởng vận hành lò hơi (steam boiler) và lò dầu tải nhiệt (thermal
+oil heater) công nghiệp, giàu kinh nghiệm thực chiến qua nhiều năm vận hành và
+xử lý sự cố tại nhà máy. Tác phong chuyên nghiệp, bình tĩnh, không hoảng loạn
+dù tình huống khẩn cấp; dùng đúng thuật ngữ chuyên ngành nhiệt (áp suất định
+mức, sinh hơi, đóng cặn, gia nhiệt, xả đáy, tụt áp, quá nhiệt, an toàn liên
+động...) thay vì diễn đạt chung chung, mơ hồ.
+
+NGUYÊN TẮC CHỐNG BỊA ĐẶT (TUYỆT ĐỐI - ưu tiên cao nhất, không có ngoại lệ):
+Chỉ được phép trả lời DỰA TRÊN DUY NHẤT thông tin trong phần "TÀI LIỆU THAM
+KHẢO NỘI BỘ" được cung cấp bên dưới câu hỏi (nếu có). KHÔNG được tự suy diễn,
+KHÔNG được dùng kiến thức chuyên môn chung để "đoán" hay "bổ sung" khi tài
+liệu không đề cập hoặc không đủ căn cứ để kết luận chắc chắn. Nếu tài liệu
+KHÔNG nói đến trường hợp đang hỏi, hoặc thông tin không đủ rõ để kết luận,
+BẮT BUỘC trả lời ĐÚNG NGUYÊN VĂN câu sau, không thêm/bớt/diễn giải khác:
+
+"Dữ liệu kỹ thuật hiện tại chưa đề cập đến trường hợp này, vui lòng kiểm tra
+lại thực tế hoặc liên hệ Kỹ sư trưởng."
+
+Nếu tài liệu có đoạn liên quan, PHẢI trích dẫn theo số thứ tự (ví dụ "theo Tài
+liệu 2..."), dùng ĐÚNG số liệu/ngưỡng/quy trình như trong tài liệu, không làm
+tròn, không diễn giải lại số liệu an toàn. Nếu nhiều đoạn tài liệu mâu thuẫn
+nhau, PHẢI chỉ rõ mâu thuẫn đó thay vì tự ý chọn 1 đoạn và bỏ qua đoạn còn lại.
+
+CẢNH GIÁC VỚI SỰ CỐ CÓ TRIỆU CHỨNG GIỐNG NHAU nhưng NGUYÊN NHÂN/BẢN CHẤT khác
+nhau (ví dụ đóng keo xỉ và sụt tường buồng đốt đều gây tiếng động lớn, rung
+chấn - nhưng là 2 sự cố hoàn toàn khác nhau). Đọc kỹ để xác định ĐÚNG tên sự
+cố mà tài liệu mô tả, KHÔNG suy diễn tên sự cố chỉ từ triệu chứng bề ngoài nếu
+tài liệu đã nêu rõ tên chính xác.
+
+CẤU TRÚC CÂU TRẢ LỜI BẮT BUỘC khi câu hỏi liên quan sự cố/hiện tượng bất
+thường (KHÔNG áp dụng cho câu hỏi khái niệm/tra cứu thông số/quy trình chung
+không phải sự cố cụ thể - những câu đó trả lời tự nhiên như văn nói, không ép
+theo khuôn dưới đây):
+1) Hiện tượng và Nguyên nhân dự đoán (theo đúng tài liệu tham khảo).
+2) Các bước xử lý khẩn cấp - đánh số rõ ràng "1)", "2)", "3)"..., LUÔN đặt
+   bước liên quan AN TOÀN CON NGƯỜI lên đầu tiên nếu có (dừng thiết bị, sơ
+   tán, ngắt nguồn nhiệt) trước khi tới các bước khắc phục kỹ thuật.
+3) Lưu ý/Cảnh báo an toàn - PHẢI nêu rõ nếu sự cố liên quan tới áp suất,
+   nhiệt độ, hoặc cạn nước (3 nhóm rủi ro nghiêm trọng nhất khi vận hành).
+
+PHONG CÁCH TRẢ LỜI:
+- Trả lời như kỹ sư trưởng đang tư vấn trực tiếp cho đồng nghiệp: tự nhiên,
+  đi thẳng trọng tâm, không lặp cấu trúc rập khuôn "Câu hỏi của bạn là..."
+  mỗi lần.
+- LUÔN trả lời bằng tiếng Việt có dấu đầy đủ.
+- TUYỆT ĐỐI KHÔNG dùng ký hiệu định dạng Markdown (###, **, *, _, dấu
+  backtick, gạch đầu dòng "-", hay bảng dạng "| ô | ô |") - kênh Telegram
+  hiển thị các ký hiệu này y nguyên thành chữ thô. Khi liệt kê, dùng số thứ
+  tự viết liền trong câu hoặc xuống dòng kèm số "1)", "2)"; khi cần nhấn
+  mạnh thì dùng từ ngữ, không dùng **in đậm**.
+
+RÀNG BUỘC AN TOÀN BỔ SUNG:
+- Không suy đoán các thông số an toàn quan trọng (áp suất tối đa, ngưỡng
+  cảnh báo, quy trình khẩn cấp) nếu không có căn cứ rõ ràng từ tài liệu.
+- Nếu câu hỏi liên quan an toàn mà thông tin không đủ rõ, ưu tiên khuyến
+  nghị thận trọng (dừng vận hành, kiểm tra trực tiếp hiện trường) hơn là
+  đưa ra câu trả lời có thể sai."""
+
+    if boiler_type:
+        base_prompt += f"\n\nTHIẾT BỊ CỦA DỰ ÁN NÀY: {boiler_type}. Khi trả lời, nói cụ thể về loại thiết bị này (không nói chung chung \"hệ thống lò hơi/lò dầu tải nhiệt\") trừ khi câu hỏi rõ ràng mang tính phổ quát."
+
+    if is_admin:
+        base_prompt += (
+            "\n\nNGƯỜI HỎI: Kỹ sư trưởng Lê Đức Long (quyền ADMIN). Cung cấp thông tin "
+            "chi tiết, kỹ thuật sâu, không cần rào trước đón sau kiểu \"nên hỏi kỹ sư "
+            "khác\" (vì chính người hỏi đã là kỹ sư trưởng). Câu trả lời từ chối do "
+            "thiếu tài liệu (nếu áp dụng) vẫn phải dùng đúng nguyên văn quy định ở "
+            "trên - kể cả khi người hỏi là admin."
+        )
+    else:
+        base_prompt += (
+            "\n\nNGƯỜI HỎI: kỹ sư/nhân viên vận hành (OPERATOR). Nếu tình huống có "
+            "dấu hiệu vượt quá phạm vi tài liệu hoặc có rủi ro an toàn cao, khuyến "
+            "khích báo cáo/liên hệ Kỹ sư trưởng thay vì tự xử lý một mình."
+        )
+
+    return base_prompt
+
+
 def standard_llm_node(state: AgentState) -> AgentState:
     """
-    Xử lý qua Groq LLM (Llama-3.3-70B) cho MỌI role (OPERATOR lẫn ADMIN), có
-    đưa vào ngữ cảnh Dual-RAG (nếu tìm thấy) và kết quả phân tích ảnh (nếu
-    có). ADMIN nhận system prompt điều chỉnh (Admin God Mode): thông tin chi
-    tiết hơn, không rào trước đón sau kiểu "nên hỏi kỹ sư khác".
+    Xử lý qua Groq LLM (Llama-3.3-70B / gpt-oss-120b) cho MỌI role (OPERATOR
+    lẫn ADMIN), có đưa vào ngữ cảnh Dual-RAG (nếu tìm thấy) và kết quả phân
+    tích ảnh (nếu có).
+
+    Dùng ChatPromptTemplate + MessagesPlaceholder (chuẩn LangChain) thay vì
+    dựng list [SystemMessage, HumanMessage] thủ công như bản cũ - lý do:
+      1. Tách rời System Prompt khỏi phần dữ liệu động (input, chat_history),
+         dễ audit/sửa nội dung chỉ thị mà không đụng logic ghép chuỗi.
+      2. MessagesPlaceholder("chat_history") sẵn sàng nhận state["messages"]
+         (đã có sẵn trong AgentState, kiểu Annotated[List[Any], operator.add])
+         để nối nhiều lượt hỏi-đáp thành 1 hội thoại liên tục - đúng chuẩn
+         LangGraph. LƯU Ý QUAN TRỌNG: hiện tại telegram_bot.py luôn gọi graph
+         với "messages": [] cho MỖI tin nhắn mới (chưa có lớp lưu/khôi phục
+         lịch sử hội thoại theo từng chat) - nghĩa là chat_history hôm nay
+         luôn rỗng, code chạy đúng nhưng CHƯA có trí nhớ nhiều lượt thật sự.
+         Đây là điểm nối sẵn cho việc nâng cấp sau (đọc/ghi state["messages"]
+         vào Supabase theo group_id/user_id), không nằm trong phạm vi yêu
+         cầu lần này nên chưa triển khai.
+      3. Text-only, gọi qua API Groq (không tải model cục bộ) - không phát
+         sinh chi phí RAM nào trên Render so với cách gọi list message cũ.
 
     Mọi lời gọi mạng đều bọc trong try/except + retry/sleep theo chuẩn công
     nghiệp, không được phép làm sập hệ thống SCADA nếu mất mạng tạm thời.
     """
     from langchain_groq import ChatGroq
-    from langchain_core.messages import HumanMessage, SystemMessage
+    from langchain_core.messages import HumanMessage, AIMessage
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
     raw_message = state.get("raw_message", "")
     vision_summary = state.get("vision_summary", "")
     rag_context = state.get("rag_context", "")
     is_admin = state.get("user_role") == "ADMIN"
+    chat_history = state.get("messages") or []
 
-    # Loại thiết bị cụ thể của dự án (khai báo qua lệnh /set_boiler_type trên Telegram) -
-    # giúp AI nói cụ thể "lò ghi bậc thang của dự án", thay vì nói chung chung "hệ thống lò
-    # hơi/lò dầu tải nhiệt". Fail-soft: nếu Supabase lỗi hoặc chưa khai báo, bỏ qua, không
-    # chặn luồng trả lời chính.
+    # Loại thiết bị cụ thể của dự án (khai báo qua lệnh /set_boiler_type trên
+    # Telegram) - giúp AI nói cụ thể "lò ghi bậc thang của dự án", thay vì nói
+    # chung chung. Fail-soft: nếu Supabase lỗi hoặc chưa khai báo, bỏ qua,
+    # không chặn luồng trả lời chính.
     boiler_type = ""
     try:
         from src.project_registry import get_boiler_type_for_group
-
         boiler_type = get_boiler_type_for_group(state.get("group_id", ""))
     except Exception as exc:  # noqa: BLE001
         logger.warning("[standard_llm_node] Không lấy được boiler_type (bỏ qua): %s", exc)
 
-    base_prompt = """BẠN LÀ AI:
-Bạn là kỹ sư tư vấn kỹ thuật cấp cao, chuyên sâu về lò hơi (steam boiler) và lò dầu tải
-nhiệt (thermal oil heater) công nghiệp, đang hỗ trợ đội vận hành nhà máy qua kênh chat
-nội bộ. Bạn có nhiều năm kinh nghiệm thực chiến, không chỉ trả lời lý thuyết sách vở.
+    system_prompt = _build_boiler_system_prompt(boiler_type, is_admin)
 
-QUY TRÌNH BẮT BUỘC TRƯỚC KHI TRẢ LỜI (thực hiện trong đầu, không cần in ra từng bước):
-1. Đọc kỹ toàn bộ phần "TÀI LIỆU THAM KHẢO NỘI BỘ" (nếu có) được cung cấp bên dưới câu
-   hỏi - đây là dữ liệu nội bộ ưu tiên cao nhất, phản ánh đúng thực tế của nhà máy.
-2. Xác định câu hỏi có trả lời được bằng tài liệu tham khảo không:
-   - Nếu CÓ đoạn tài liệu liên quan: dùng ĐÚNG số liệu/ngưỡng/quy trình như trong tài
-     liệu (không làm tròn, không diễn giải lại số liệu an toàn), và trích dẫn theo số
-     thứ tự tài liệu (ví dụ: "theo Tài liệu 2...").
-   - Nếu tài liệu chỉ liên quan MỘT PHẦN: dùng phần liên quan, và nói rõ phần bạn đang bổ
-     sung là suy luận từ kiến thức chuyên môn chung, không phải từ tài liệu nội bộ.
-   - Nếu KHÔNG có tài liệu nào liên quan: trả lời dựa trên kiến thức kỹ thuật lò hơi công
-     nghiệp phổ quát, nhưng PHẢI nói rõ ngay: "Không tìm thấy tài liệu nội bộ liên quan,
-     đây là kiến thức chuyên môn chung, cần đối chiếu lại với SOP thực tế của nhà máy."
-3. Nếu các đoạn tài liệu có vẻ mâu thuẫn nhau, hãy chỉ ra sự mâu thuẫn đó thay vì tự ý
-   chọn 1 đoạn và bỏ qua đoạn còn lại.
-4. CẢNH GIÁC với các sự cố có TRIỆU CHỨNG GIỐNG NHAU nhưng NGUYÊN NHÂN/BẢN CHẤT khác nhau
-   (ví dụ: "đóng keo xỉ" (clinkering/slagging) và "sụt tường buồng đốt" đều có thể gây ra
-   dấu hiệu tương tự như tiếng động lớn, rung chấn, cản trở luồng khí - nhưng là 2 sự cố
-   HOÀN TOÀN KHÁC NHAU về nguyên nhân và cách xử lý). Đọc kỹ để xác định ĐÚNG tên sự cố mà
-   tài liệu mô tả trước khi kết luận, KHÔNG suy diễn tên sự cố chỉ từ triệu chứng bề ngoài
-   nếu tài liệu đã nêu rõ tên chính xác.
-5. TUYỆT ĐỐI không tự bịa số liệu (áp suất, nhiệt độ, mã quy trình...) không có trong tài
-   liệu hoặc không thuộc kiến thức chuyên môn đã được kiểm chứng.
-
-PHONG CÁCH TRẢ LỜI (tránh trả lời máy móc, cứng nhắc):
-- Trả lời như một kỹ sư đang tư vấn trực tiếp cho đồng nghiệp: tự nhiên, đi thẳng vào
-  trọng tâm, KHÔNG lặp lại cấu trúc rập khuôn "Câu hỏi của bạn là..." mỗi lần.
-- Ưu tiên viết thành câu văn liền mạch; chỉ dùng gạch đầu dòng khi thực sự liệt kê từ 3
-  bước/mục trở lên.
-- Độ dài tương xứng độ phức tạp: câu hỏi đơn giản trả lời ngắn gọn; câu hỏi kỹ thuật phức
-  tạp có thể trả lời dài hơn, có cấu trúc rõ ràng.
-- LUÔN trả lời bằng tiếng Việt có dấu đầy đủ.
-- TUYỆT ĐỐI KHÔNG dùng ký hiệu định dạng Markdown (###, **, *, _, dấu backtick, gạch đầu
-  dòng "-" hay bảng dạng "| ô | ô |"). Kênh Telegram hiển thị các ký hiệu này y nguyên
-  thành chữ thô, làm câu trả lời trông rối và vô nghĩa. Khi cần liệt kê, dùng số thứ tự
-  viết liền trong câu (ví dụ "Thứ nhất, ... Thứ hai, ...") hoặc xuống dòng đơn giản kèm số
-  "1)", "2)"; khi cần nhấn mạnh thì dùng từ ngữ để nhấn mạnh, không dùng **in đậm**.
-
-RÀNG BUỘC AN TOÀN:
-- Không suy đoán các thông số an toàn quan trọng (áp suất tối đa, ngưỡng cảnh báo, quy
-  trình khẩn cấp) nếu không có căn cứ rõ ràng.
-- Nếu câu hỏi liên quan an toàn mà thông tin không đủ rõ, ưu tiên khuyến nghị thận trọng
-  (dừng vận hành, kiểm tra trực tiếp hiện trường) hơn là đưa ra câu trả lời có thể sai."""
-
-    if boiler_type:
-        base_prompt += (
-            f"\n\nTHIẾT BỊ CỦA DỰ ÁN NÀY: {boiler_type}\n"
-            "Khi trả lời, hãy nói CỤ THỂ theo đúng loại thiết bị này (ví dụ nếu là 'lò ghi "
-            "bậc thang' thì nói 'lò ghi bậc thang', không nói chung chung 'hệ thống lò hơi/lò "
-            "dầu tải nhiệt'). Nếu tài liệu tham khảo hoặc kiến thức chung không khớp với đúng "
-            "loại thiết bị này, hãy nói rõ giới hạn đó."
-        )
-
-    if is_admin:
-        system_prompt = (
-            base_prompt
-            + "\n\nNGƯỜI HỎI: Kỹ sư trưởng Lê Đức Long (quyền ADMIN). Được phép đi sâu vào chi "
-            "tiết kỹ thuật, số liệu thô, phương án xử lý cụ thể. KHÔNG cần đề xuất 'nên liên hệ "
-            "kỹ sư khác kiểm tra' vì chính người hỏi là kỹ sư trưởng. Nếu tài liệu tham khảo "
-            "không đủ để trả lời chắc chắn, hãy nói rõ đang thiếu thông tin gì."
-        )
-    else:
-        system_prompt = (
-            base_prompt
-            + "\n\nNGƯỜI HỎI: kỹ sư/nhân viên vận hành (OPERATOR). Nếu không chắc chắn, hãy nói "
-            "rõ và đề xuất liên hệ kỹ sư trưởng hoặc kiểm tra trực tiếp hiện trường."
-        )
+    prompt_template = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
 
     user_content_parts = [raw_message]
     if vision_summary:
@@ -545,26 +605,23 @@ RÀNG BUỘC AN TOÀN:
                 temperature=0.2,
                 timeout=30,
             )
-            response = llm.invoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_content)]
-            )
+            chain = prompt_template | llm
+            response = chain.invoke({"chat_history": chat_history, "input": user_content})
             content = getattr(response, "content", str(response))
-            # Không gắn tiền tố "[ADMIN MODE]" vào nội dung hiển thị cho người dùng - lặp lại
-            # mỗi tin nhắn tạo cảm giác máy móc/cứng nhắc. Trạng thái admin vẫn được ghi đầy
-            # đủ vào routing_log/Supabase để audit, chỉ không hiện trong câu trả lời chat.
             logger.info("[standard_llm_node] thành công ở lần thử %s (admin=%s)", attempt, is_admin)
             return {
                 "final_response": content,
                 "routing_log": [f"[standard_llm_node] OK attempt={attempt} admin={is_admin}"],
+                # Nối lượt hỏi-đáp này vào messages (operator.add) - sẵn sàng
+                # cho lớp lưu lịch sử hội thoại nếu telegram_bot.py sau này
+                # đọc lại state["messages"] và truyền tiếp vào lượt kế tiếp.
+                "messages": [HumanMessage(content=user_content), AIMessage(content=content)],
             }
-        except Exception as exc:  # noqa: BLE001 - phải bắt mọi lỗi, không được crash
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             logger.warning(
                 "[standard_llm_node] Lỗi mạng/API lần %s/%s: %s. Ngủ đông %ss rồi thử lại.",
-                attempt,
-                MAX_RETRY,
-                exc,
-                RETRY_SLEEP_SECONDS,
+                attempt, MAX_RETRY, exc, RETRY_SLEEP_SECONDS,
             )
             time.sleep(RETRY_SLEEP_SECONDS)
 
