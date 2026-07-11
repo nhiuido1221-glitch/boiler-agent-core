@@ -398,6 +398,17 @@ def _build_bot(compiled_graph):
         try:
             action, delete_id = call.data.split(":", 1)
 
+            # BẢO MẬT: kiểm tra người BẤM NÚT ngay bây giờ (call.from_user.id), KHÔNG phải
+            # người đã gõ lệnh /delete_project lúc trước (info["telegram_user_id"]). Nút bấm
+            # hiển thị cho CẢ NHÓM thấy (Telegram inline keyboard không riêng tư theo người
+            # gửi) - nếu chỉ kiểm tra người gõ lệnh gốc, bất kỳ thành viên nào trong nhóm
+            # cũng có thể bấm thay và vượt qua được lớp ADMIN gate. Áp dụng cho CẢ nút Huỷ,
+            # tránh 1 thành viên bất kỳ âm thầm huỷ thao tác của ADMIN.
+            clicker_id = str(call.from_user.id) if call.from_user else ""
+            if _resolve_role(clicker_id) != "ADMIN":
+                bot.answer_callback_query(call.id, "Chỉ ADMIN mới được thao tác.")
+                return
+
             if action == "delcancel":
                 with _pending_deletes_lock:
                     _pending_deletes.pop(delete_id, None)
@@ -412,10 +423,6 @@ def _build_bot(compiled_graph):
 
             if not info:
                 bot.answer_callback_query(call.id, "Phiên xác nhận đã hết hạn (bot có thể đã khởi động lại). Gõ lại lệnh.")
-                return
-
-            if _resolve_role(info["telegram_user_id"]) != "ADMIN":
-                bot.answer_callback_query(call.id, "Chỉ ADMIN mới được thao tác.")
                 return
 
             target_project_id = info["project_id"]
@@ -529,7 +536,12 @@ def _build_bot(compiled_graph):
                 bot.answer_callback_query(call.id, "Phiên upload đã hết hạn (bot có thể đã khởi động lại). Gửi lại file.")
                 return
 
-            if _resolve_role(info["telegram_user_id"]) != "ADMIN":
+            # BẢO MẬT: kiểm tra người BẤM NÚT ngay bây giờ (call.from_user.id), KHÔNG phải
+            # người đã upload file lúc trước (info["telegram_user_id"]) - xem giải thích đầy
+            # đủ ở handle_delete_project_choice. Nút chọn "Kho DÙNG CHUNG"/"Dự án hiện tại"
+            # hiển thị cho cả nhóm thấy, không riêng tư theo người upload.
+            clicker_id = str(call.from_user.id) if call.from_user else ""
+            if _resolve_role(clicker_id) != "ADMIN":
                 bot.answer_callback_query(call.id, "Chỉ ADMIN mới được thao tác.")
                 return
 
