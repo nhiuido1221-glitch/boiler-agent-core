@@ -42,6 +42,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
 
 logger = logging.getLogger("telegram_bot")
@@ -486,6 +487,64 @@ def _build_bot(compiled_graph):
             bot.reply_to(message, f"❌ Đã xảy ra lỗi khi xử lý lệnh: {exc}")
 
     # --------------------------------------------------------------------
+    # Nút "Đã xác nhận" đính kèm tin cảnh báo khẩn cấp (is_emergency=True) do
+    # send_notification() tự động gắn - xem send_notification() bên dưới.
+    # ADMIN bấm nút này thay vì phải tự gõ SQL/lệnh - chèn thẳng lệnh
+    # 'ack_alert' vào station_commands, máy trạm tự nhặt trong tối đa
+    # poll_interval_seconds (mặc định 30s) và tạm ngưng gửi cảnh báo lặp lại
+    # trong ack_mute_minutes phút (mặc định 30 phút, tự động bật lại sau đó).
+    # --------------------------------------------------------------------
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("ackalert:"))
+    def handle_ack_alert_button(call):
+        try:
+            _, group_id = call.data.split(":", 1)
+
+            # BAO MAT: kiem tra nguoi BAM NUT ngay bay gio (call.from_user.id) -
+            # nut nay hien thi cho CA GROUP thay (Telegram inline keyboard khong
+            # rieng tu theo nguoi nhan tin canh bao), giong nguyen tac da ap dung
+            # cho nut xoa du an / chon kho luu tai lieu o tren.
+            clicker_id = str(call.from_user.id) if call.from_user else ""
+            if _resolve_role(clicker_id) != "ADMIN":
+                bot.answer_callback_query(call.id, "Chỉ ADMIN mới được xác nhận cảnh báo.")
+                return
+
+            from src.supabase_logger import queue_station_command
+
+            ok, info = queue_station_command(group_id, "ack_alert")
+
+            if ok:
+                bot.answer_callback_query(call.id, "Đã xác nhận, tạm ngưng cảnh báo lặp lại.")
+                confirm_note = (
+                    f"\n\n✅ ADMIN đã xác nhận lúc "
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Tạm ngưng cảnh báo lặp lại."
+                )
+                try:
+                    if call.message.content_type == "photo":
+                        old_caption = call.message.caption or ""
+                        bot.edit_message_caption(
+                            caption=(old_caption + confirm_note)[:1024],
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                        )
+                    else:
+                        old_text = call.message.text or ""
+                        bot.edit_message_text(
+                            (old_text + confirm_note)[:4096],
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                        )
+                except Exception as exc:  # noqa: BLE001 - sua tin chi la trang tri, khong duoc lam fail xac nhan
+                    logger.warning("[handle_ack_alert_button] Không sửa được tin gốc (bỏ qua, đã ghi nhận ack): %s", exc)
+            else:
+                bot.answer_callback_query(call.id, f"Lỗi: {info[:180]}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Lỗi xử lý nút xác nhận cảnh báo: %s", exc)
+            try:
+                bot.answer_callback_query(call.id, f"Lỗi: {exc}"[:200])
+            except Exception:  # noqa: BLE001
+                pass
+
+    # --------------------------------------------------------------------
     # Xoá dự án (chỉ ADMIN) - PHÁ HUỶ DỮ LIỆU VĨNH VIỄN, bắt buộc xác nhận qua nút bấm
     # --------------------------------------------------------------------
     @bot.message_handler(commands=["delete_project"])
@@ -890,7 +949,8 @@ def _build_bot(compiled_graph):
     return bot
 
 
-def send_notification(group_id: str, text: str, image_data_urls: Optional[list[str]] = None) -> bool:
+def send_notification(group_id: str, text: str, image_data_urls: Optional[list[str]] = None,
+                       is_emergency: bool = False) -> bool:
     """
     Gui 1 thong bao CHU DONG toi group_id (KHONG phai tra loi 1 tin nhan Telegram
     co san, khac voi _send_long_reply luon can 1 object `message` that de reply_to)
@@ -911,6 +971,13 @@ def send_notification(group_id: str, text: str, image_data_urls: Optional[list[s
     "data:image/png;base64,<...>" (xem screenshot.encode_image_base64() ben Station
     Agent) - tu giai ma base64 truoc khi goi bot.send_photo (Telegram API can bytes
     anh that, khong nhan duoc chuoi base64/data-URL truc tiep).
+
+    is_emergency: neu True, dinh kem 1 nut inline "Da xac nhan" vao PHAN CUOI
+    CUNG duoc gui (tin text cuoi neu co, khong thi anh cuoi) - ADMIN bam nut
+    nay se tu dong chen lenh 'ack_alert' vao station_commands (xem
+    handle_ack_alert_button ben tren), thay vi phai tu go SQL tay. Chi gan 1
+    nut duy nhat cho ca lan gui (kha nang tin bi chia nhieu doan do qua dai),
+    tranh nut bam bi lap lai nhieu lan gay roi mat.
 
     Fail-soft TUYET DOI: KHONG BAO GIO de loi Telegram lam fail request /invoke
     chinh (day la nguyen tac cong nghiep xuyen suot toan bo file nay) - moi loi deu
@@ -934,25 +1001,44 @@ def send_notification(group_id: str, text: str, image_data_urls: Optional[list[s
 
     ok = True
 
-    if text:
-        for chunk in _split_long_message(text):
-            sent = False
-            for attempt in range(1, 4):
-                try:
-                    _bot_instance.send_message(chat_id, chunk)
-                    sent = True
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[send_notification] Lỗi gửi text lần %s/3 (chat_id=%s): %s",
-                        attempt, chat_id, exc,
-                    )
-                    if attempt < 3:
-                        time.sleep(RETRY_SLEEP_SECONDS)
-            if not sent:
-                ok = False
+    markup = None
+    if is_emergency:
+        from telebot import types
 
-    for data_url in (image_data_urls or []):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton(
+                "✅ Đã xác nhận (tạm ngưng cảnh báo lặp lại)", callback_data=f"ackalert:{group_id}"
+            )
+        )
+
+    text_chunks = _split_long_message(text) if text else []
+    images = image_data_urls or []
+    total_parts = len(text_chunks) + len(images)
+    part_idx = 0
+
+    for chunk in text_chunks:
+        part_idx += 1
+        part_markup = markup if part_idx == total_parts else None
+        sent = False
+        for attempt in range(1, 4):
+            try:
+                _bot_instance.send_message(chat_id, chunk, reply_markup=part_markup)
+                sent = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[send_notification] Lỗi gửi text lần %s/3 (chat_id=%s): %s",
+                    attempt, chat_id, exc,
+                )
+                if attempt < 3:
+                    time.sleep(RETRY_SLEEP_SECONDS)
+        if not sent:
+            ok = False
+
+    for data_url in images:
+        part_idx += 1
+        part_markup = markup if part_idx == total_parts else None
         try:
             b64_part = data_url.split(",", 1)[1] if "," in data_url else data_url
             raw_bytes = base64.b64decode(b64_part)
@@ -964,7 +1050,7 @@ def send_notification(group_id: str, text: str, image_data_urls: Optional[list[s
         sent = False
         for attempt in range(1, 4):
             try:
-                _bot_instance.send_photo(chat_id, io.BytesIO(raw_bytes))
+                _bot_instance.send_photo(chat_id, io.BytesIO(raw_bytes), reply_markup=part_markup)
                 sent = True
                 break
             except Exception as exc:  # noqa: BLE001
