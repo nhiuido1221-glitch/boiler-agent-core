@@ -206,8 +206,14 @@ def _build_bot(compiled_graph):
     # bien "treo vinh vien" thanh "bao loi co gioi han thoi gian" - dung
     # nguyen tac cong nghiep bat buoc cua du an (khong duoc im lang khi mat
     # mang tam thoi).
-    apihelper.CONNECT_TIMEOUT = 15
-    apihelper.READ_TIMEOUT = 20
+    # Da tang tu (15, 20) -> (30, 90): log Render thuc te cho thay send_photo() (gui
+    # anh SCADA) lien tuc bao 'Connection aborted... write operation timed out' khi
+    # mang tam thoi cham/bi canh tranh boi request /invoke khac chay song song -
+    # 20s la qua ngan de day het 1 anh PNG chup man hinh len Telegram trong dieu
+    # kien do. READ_TIMEOUT can lon hon CONNECT_TIMEOUT nhieu vi day la thoi gian
+    # cho ca qua trinh upload + Telegram xu ly xong, khong chi cho luc ket noi.
+    apihelper.CONNECT_TIMEOUT = 30
+    apihelper.READ_TIMEOUT = 90
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     if not token or token.startswith("xxxxxx"):
@@ -1023,7 +1029,7 @@ def send_notification(group_id: str, text: str, image_data_urls: Optional[list[s
         sent = False
         for attempt in range(1, 4):
             try:
-                _bot_instance.send_message(chat_id, chunk, reply_markup=part_markup)
+                _bot_instance.send_message(chat_id, chunk, reply_markup=part_markup, timeout=60)
                 sent = True
                 break
             except Exception as exc:  # noqa: BLE001
@@ -1050,7 +1056,7 @@ def send_notification(group_id: str, text: str, image_data_urls: Optional[list[s
         sent = False
         for attempt in range(1, 4):
             try:
-                _bot_instance.send_photo(chat_id, io.BytesIO(raw_bytes), reply_markup=part_markup)
+                _bot_instance.send_photo(chat_id, io.BytesIO(raw_bytes), reply_markup=part_markup, timeout=90)
                 sent = True
                 break
             except Exception as exc:  # noqa: BLE001
