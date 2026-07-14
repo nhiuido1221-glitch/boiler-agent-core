@@ -243,8 +243,14 @@ def vision_analysis_node(state: AgentState) -> AgentState:
                         "được)\", ví dụ \"Nhiệt độ buồng đốt đang Thấp (104 độ C)\". LUÔN ưu tiên dùng "
                         "tên thông số bằng tiếng Việt hiển thị trên màn hình (không chỉ nêu mã tag kỹ "
                         "thuật như PT04, TT09 một mình) và KHÔNG dùng cụm \"cảnh báo đỏ\"/\"cảnh báo "
-                        "vàng\" (không phải thuật ngữ vận hành đúng chuẩn). Nếu toàn bộ đều xanh/bình "
-                        "thường, KHÔNG dùng 2 cụm cố định trên, mô tả bình thường. "
+                        "vàng\" (không phải thuật ngữ vận hành đúng chuẩn). "
+                        "QUAN TRỌNG: khi ĐÃ phát hiện cảnh báo (đỏ hoặc vàng), CHỈ trả lời đúng cụm cố "
+                        "định + danh sách thông số bất thường theo đúng mẫu trên - DỪNG LẠI Ở ĐÓ, "
+                        "KHÔNG mô tả thêm các thông số khác đang bình thường, KHÔNG thêm đoạn tổng "
+                        "quan/kết luận, KHÔNG giải thích ý nghĩa thông số - chỉ cần kết quả cảnh báo "
+                        "ngắn gọn để gửi thẳng làm tin cảnh báo khẩn cấp. Nếu toàn bộ đều xanh/bình "
+                        "thường (không có cảnh báo nào), KHÔNG dùng 2 cụm cố định trên, mô tả bình "
+                        "thường như yêu cầu ở đầu. "
                         "Trả lời bằng tiếng Việt có dấu."
                     ),
                 }
@@ -491,20 +497,24 @@ def emergency_handler_node(state: AgentState) -> AgentState:
     thuộc uptime Groq API trong tình huống an toàn), trả về cảnh báo ngay lập
     tức kèm từ khóa đã phát hiện.
 
-    Từ bản này: kèm thêm nguyên văn vision_summary (nếu có) vào tin nhắn cảnh
-    báo - trước đây chỉ liệt kê danh sách từ khóa (vd "canh bao do"), không đủ
-    để ADMIN biết CHÍNH XÁC thông số/vị trí nào đang bất thường mà không phải
-    tự mở lại ảnh đối chiếu.
+    Tu ban nay (theo yeu cau anh Long 2026-07-15): CHI gui KET QUA canh bao
+    (ten thong so + trang thai Cao/Thap), KHONG gui phan mo ta/y nghia chi
+    tiet cua tung thong so binh thuong khac nua. vision_summary tu
+    vision_analysis_node gio DA duoc thiet ke de CHI liet ke cac thong so BAT
+    THUONG khi co canh bao (xem prompt rieng trong vision_analysis_node), nen
+    dung TRUC TIEP lam noi dung canh bao - khong con boc them dong "[tu khoa]"
+    hay tien to "Chi tiet tu phan tich anh SCADA:" gay trung lap/dai dong nua.
     """
+    vision_summary = (state.get("vision_summary") or "").strip()
     keywords = state.get("keywords_found", [])
-    vision_summary = state.get("vision_summary", "")
 
-    lines = [f"⚠️ CẢNH BÁO KHẨN CẤP: Phát hiện dấu hiệu sự cố [{', '.join(keywords)}]."]
     if vision_summary:
-        lines.append(f"Chi tiết từ phân tích ảnh SCADA: {vision_summary}")
+        lines = ["⚠️ CẢNH BÁO KHẨN CẤP:", vision_summary]
+    else:
+        lines = [f"⚠️ CẢNH BÁO KHẨN CẤP: Phát hiện dấu hiệu sự cố [{', '.join(keywords)}]."]
     lines.append(
-        "Hệ thống đã ghi nhận ưu tiên cao nhất. Kỹ sư vận hành vui lòng kiểm tra "
-        "hiện trường ngay lập tức và thực hiện quy trình ứng phó khẩn cấp."
+        "Kỹ sư vận hành vui lòng kiểm tra hiện trường ngay lập tức và thực hiện "
+        "quy trình ứng phó khẩn cấp."
     )
     msg = "\n".join(lines)
 
