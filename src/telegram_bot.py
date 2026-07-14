@@ -35,6 +35,8 @@ vòng lặp được bọc try/except + sleep/retry, không bao giờ để thre
 """
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import os
 import threading
@@ -836,6 +838,98 @@ def _build_bot(compiled_graph):
                 pass  # nếu cả gửi lỗi cũng fail (vd mất mạng), bỏ qua, không crash bot
 
     return bot
+
+
+def send_notification(group_id: str, text: str, image_data_urls: Optional[list[str]] = None) -> bool:
+    """
+    Gui 1 thong bao CHU DONG toi group_id (KHONG phai tra loi 1 tin nhan Telegram
+    co san, khac voi _send_long_reply luon can 1 object `message` that de reply_to)
+    - dung khi main.py (/invoke) nhan payload.notify_telegram=True hoac
+    result["is_emergency"]=True, vi du: Boiler Station Agent goi /invoke truc tiep
+    (khong qua webhook Telegram goc) va can day bao cao/canh bao ve group.
+
+    LUU Y KIEN TRUC: day la lan dau /invoke can gui Telegram - truoc gio /invoke
+    (main.py) chi tra JSON ve cho ben goi, khong bao gio dung toi Telegram; chi
+    telegram_bot.py (qua webhook/long-polling that) moi tung gui Telegram. Ham nay
+    dung LAI dung _bot_instance dang polling (khong tao TeleBot() moi, tranh 1 bot
+    token ket noi 2 lan gay xung dot) - vi vay CHI hoat dong SAU KHI bot da ket noi
+    xong (_bot_instance khac None); tai thoi diem app FastAPI vua khoi dong (vai
+    giay dau, truoc khi polling thread ket noi xong), ham nay se fail-soft tra ve
+    False, khong raise loi.
+
+    image_data_urls: nhan dung dinh dang Station Agent dang gui - data URL kieu
+    "data:image/png;base64,<...>" (xem screenshot.encode_image_base64() ben Station
+    Agent) - tu giai ma base64 truoc khi goi bot.send_photo (Telegram API can bytes
+    anh that, khong nhan duoc chuoi base64/data-URL truc tiep).
+
+    Fail-soft TUYET DOI: KHONG BAO GIO de loi Telegram lam fail request /invoke
+    chinh (day la nguyen tac cong nghiep xuyen suot toan bo file nay) - moi loi deu
+    duoc bat va log, ham chi tra ve True/False de bien goi (main.py) ghi log, khong
+    anh huong gi den HTTP response tra ve cho Station Agent.
+    """
+    if _bot_instance is None:
+        logger.warning(
+            "[send_notification] Bot Telegram chua san sang (chua ket noi xong hoac "
+            "dang trong chu ky reconnect) - bo qua gui thong bao chu dong toi "
+            "group_id=%s. Neu loi nay lap lai nhieu lan, kiem tra TELEGRAM_BOT_TOKEN/"
+            "TELEGRAM_POLL_ENABLED va log luc khoi dong app.", group_id,
+        )
+        return False
+
+    try:
+        chat_id = int(group_id)
+    except (TypeError, ValueError):
+        logger.warning("[send_notification] group_id không hợp lệ để gửi Telegram: %r", group_id)
+        return False
+
+    ok = True
+
+    if text:
+        for chunk in _split_long_message(text):
+            sent = False
+            for attempt in range(1, 4):
+                try:
+                    _bot_instance.send_message(chat_id, chunk)
+                    sent = True
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[send_notification] Lỗi gửi text lần %s/3 (chat_id=%s): %s",
+                        attempt, chat_id, exc,
+                    )
+                    if attempt < 3:
+                        time.sleep(RETRY_SLEEP_SECONDS)
+            if not sent:
+                ok = False
+
+    for data_url in (image_data_urls or []):
+        try:
+            b64_part = data_url.split(",", 1)[1] if "," in data_url else data_url
+            raw_bytes = base64.b64decode(b64_part)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[send_notification] Lỗi giải mã ảnh base64 (bỏ qua ảnh này): %s", exc)
+            ok = False
+            continue
+
+        sent = False
+        for attempt in range(1, 4):
+            try:
+                _bot_instance.send_photo(chat_id, io.BytesIO(raw_bytes))
+                sent = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[send_notification] Lỗi gửi ảnh lần %s/3 (chat_id=%s): %s",
+                    attempt, chat_id, exc,
+                )
+                if attempt < 3:
+                    time.sleep(RETRY_SLEEP_SECONDS)
+        if not sent:
+            ok = False
+
+    if ok:
+        logger.info("[send_notification] Đã gửi thông báo chủ động tới group_id=%s.", group_id)
+    return ok
 
 
 def _polling_loop(compiled_graph):

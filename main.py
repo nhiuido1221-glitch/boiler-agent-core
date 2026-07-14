@@ -29,7 +29,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("main")
 
 from src.boiler_graph_builder import build_graph  # noqa: E402  (phải load sau load_dotenv)
-from src.telegram_bot import start_telegram_bot_background  # noqa: E402
+from src.telegram_bot import start_telegram_bot_background, send_notification  # noqa: E402
 
 ADMIN_ID = os.getenv("ADMIN_ID", "")
 
@@ -70,6 +70,17 @@ class InvokeRequest(BaseModel):
     images: list[str] = Field(default_factory=list)
     telegram_user_id: Optional[str] = Field(
         default=None, description="ID Telegram của người gửi, dùng để xác thực ADMIN"
+    )
+    notify_telegram: bool = Field(
+        default=False,
+        description=(
+            "Neu True, /invoke se chu dong day final_response (+ anh neu co) vao "
+            "Telegram group_id ngay sau khi xu ly xong - dung cho cac nguon goi "
+            "truc tiep (khong qua webhook Telegram goc), vi du Boiler Station "
+            "Agent. Mac dinh False de tranh spam Telegram khi /invoke duoc goi de "
+            "test/tich hop. Emergency (is_emergency=True) LUON duoc day di, khong "
+            "phu thuoc co nay."
+        ),
     )
 
 
@@ -149,6 +160,28 @@ def invoke_agent(payload: InvokeRequest) -> InvokeResponse:
         raise HTTPException(status_code=500, detail=f"Lỗi xử lý nội bộ: {exc}") from exc
 
     elapsed_ms = int((time.time() - start_time) * 1000)
+
+    # Day Telegram khi: (a) ben goi chu dong yeu cau qua notify_telegram=True, HOAC
+    # (b) Rule Layer xac dinh day la tinh huong khan cap - emergency LUON duoc day,
+    # khong phu thuoc co notify_telegram cua ben goi. Boc try/except NGOAI CUNG:
+    # loi gui Telegram TUYET DOI khong duoc lam fail request /invoke chinh - day
+    # nguyen tac cong nghiep xuyen suot du an (station SCADA khong duoc phep sap
+    # chi vi kenh thong bao phu loi tam thoi).
+    should_notify = payload.notify_telegram or result.get("is_emergency", False)
+    if should_notify:
+        try:
+            sent_ok = send_notification(
+                group_id=payload.group_id,
+                text=result.get("final_response", ""),
+                image_data_urls=payload.images,
+            )
+            logger.info(
+                "Da day Telegram cho request /invoke (group_id=%s, notify_telegram=%s, "
+                "is_emergency=%s): %s",
+                payload.group_id, payload.notify_telegram, result.get("is_emergency", False), sent_ok,
+            )
+        except Exception as exc:  # noqa: BLE001 - khong duoc lam fail /invoke chi vi loi Telegram
+            logger.exception("Loi khi day Telegram tu /invoke (bo qua, van tra response binh thuong): %s", exc)
 
     return InvokeResponse(
         final_response=result.get("final_response", "Không có phản hồi."),
