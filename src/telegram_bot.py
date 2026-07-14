@@ -244,7 +244,9 @@ def _build_bot(compiled_graph):
             "• Gửi file .txt/.pdf/.docx - (ADMIN) nạp tài liệu; bot cho chọn NƠI LƯU bằng nút bấm, "
             "kể cả từ chat riêng cũng chọn được thẳng dự án mong muốn, không cần vào đúng nhóm đó.\n"
             "• LƯU LẠI: <nội dung> - (ADMIN) dạy AI 1 kinh nghiệm thực tế, lưu ngay vào kho.\n"
-            "• /delete_project <mã> - (ADMIN) XOÁ VĨNH VIỄN 1 dự án (cả tài liệu), có xác nhận qua nút bấm.",
+            "• /delete_project <mã> - (ADMIN) XOÁ VĨNH VIỄN 1 dự án (cả tài liệu), có xác nhận qua nút bấm.\n"
+            "• /scada - (ADMIN) yêu cầu máy trạm chụp ảnh SCADA + phân tích dữ liệu từ đầu ca NGAY LẬP TỨC "
+            "(không cần đợi chu kỳ tự động), kết quả gửi thẳng vào group này trong ít phút.",
         )
 
     # --------------------------------------------------------------------
@@ -433,6 +435,54 @@ def _build_bot(compiled_graph):
             _send_long_reply(bot, message, "".join(lines))
         except Exception as exc:  # noqa: BLE001
             logger.exception("Lỗi xử lý /list_projects: %s", exc)
+            bot.reply_to(message, f"❌ Đã xảy ra lỗi khi xử lý lệnh: {exc}")
+
+    # --------------------------------------------------------------------
+    # /scada (chỉ ADMIN) - yêu cầu máy trạm chụp ảnh SCADA + phân tích tức thời
+    # --------------------------------------------------------------------
+    @bot.message_handler(commands=["scada"])
+    def handle_scada_instant_report(message):
+        """
+        ADMIN gõ /scada trong group -> Core tra bảng 'stations' tìm máy trạm gắn
+        với group_id này -> chèn 1 lệnh 'instant_report' vào station_commands
+        (Supabase). Máy trạm đang chạy sẽ tự poll thấy lệnh này trong tối đa
+        ~30s (chu kỳ poll_interval_seconds cấu hình ở máy trạm), chụp ảnh SCADA
+        NGAY tại thời điểm đó + tổng hợp dữ liệu từ đầu ca hiện tại đến lúc yêu
+        cầu, rồi tự gọi /invoke với notify_telegram=True để đẩy kết quả (kèm
+        ảnh) vào ĐÚNG group này - không cần ADMIN tự vào Supabase Studio chạy
+        SQL tay như lúc kiểm thử ban đầu.
+
+        Đây là hành động "yêu cầu", KHÔNG phải kết quả tức thì trong cùng 1 lượt
+        trả lời - bot chỉ xác nhận đã gửi yêu cầu thành công, kết quả THẬT sẽ đến
+        sau (từ /invoke của máy trạm) như một tin nhắn RIÊNG.
+        """
+        try:
+            telegram_user_id = str(message.from_user.id) if message.from_user else ""
+            if _resolve_role(telegram_user_id) != "ADMIN":
+                bot.reply_to(message, "Chỉ ADMIN mới được yêu cầu chụp ảnh SCADA tức thời.")
+                return
+
+            group_id = str(message.chat.id)
+            from src.supabase_logger import queue_station_command
+
+            ok, info = queue_station_command(group_id, "instant_report")
+            if ok:
+                bot.reply_to(
+                    message,
+                    f"📸 Đã gửi yêu cầu tới máy trạm ({info}). Máy trạm sẽ chụp ảnh SCADA + "
+                    "tổng hợp dữ liệu từ đầu ca đến giờ, thường mất tối đa khoảng 1 phút "
+                    "(chu kỳ máy trạm kiểm tra lệnh mới). Kết quả sẽ tự động gửi vào đây "
+                    "ngay khi xong, không cần gõ lệnh lại.",
+                )
+            else:
+                bot.reply_to(
+                    message,
+                    f"❌ Không gửi được yêu cầu tới máy trạm: {info}\n"
+                    "Kiểm tra máy trạm đã đăng ký đúng group này trong bảng 'stations' "
+                    "(cột group_id) và đang ở trạng thái is_active=true chưa.",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Lỗi xử lý /scada: %s", exc)
             bot.reply_to(message, f"❌ Đã xảy ra lỗi khi xử lý lệnh: {exc}")
 
     # --------------------------------------------------------------------
