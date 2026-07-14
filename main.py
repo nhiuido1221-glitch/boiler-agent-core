@@ -174,6 +174,7 @@ def invoke_agent(payload: InvokeRequest) -> InvokeResponse:
                 group_id=payload.group_id,
                 text=result.get("final_response", ""),
                 image_data_urls=payload.images,
+                is_emergency=result.get("is_emergency", False),
             )
             logger.info(
                 "Da day Telegram cho request /invoke (group_id=%s, notify_telegram=%s, "
