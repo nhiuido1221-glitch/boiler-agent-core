@@ -103,6 +103,27 @@ EMERGENCY_KEYWORDS = [
     "tắt lửa",
 ]
 
+# Cum tu CO DINH, quet RIENG tren vision_summary (mo ta anh do chinh AI phan tich
+# sinh ra) - HOAN TOAN DOC LAP voi EMERGENCY_KEYWORD_GATE_ENABLED o tren. Ly do
+# tach rieng (phan hoi anh Long 2026-07-14): bao dong gia truoc day la do quet tho
+# tren CAU HOI VAN BAN cua nguoi dung (vi du "tai sao lo bi MAT NUOC" - cau hoi
+# thong tin, khong phai su co that) - rui ro nay KHONG ap dung cho vision_summary,
+# vi day la MO TA THUC TE do chinh Vision Model quan sat tu anh SCADA, khong phai
+# cau hoi gia dinh. Vi vay co the BAT LUON, khong can cho bien moi truong, ma khong
+# tai dien van de bao dong gia tren cau hoi thong tin da gap truoc do.
+#
+# Cum tu duoc THIET KE DE VISION MODEL TU DUNG DUNG NGUYEN VAN (xem system prompt
+# moi trong vision_analysis_node) khi phat hien o mau do/vang tren man hinh SCADA
+# (quy uoc co dinh: nen do + chu "H" = vuot nguong cao; nen vang + chu "L" = duoi
+# nguong an toan) - nho vay khop chinh xac, giam toi da rui ro bao dong gia so voi
+# quet tu khoa tho tren van ban tu do nguoi dung go.
+VISION_ALERT_MARKERS = [
+    "phat hien canh bao do",
+    "phát hiện cảnh báo đỏ",
+    "phat hien canh bao vang",
+    "phát hiện cảnh báo vàng",
+]
+
 MAX_RETRY = 3
 RETRY_SLEEP_SECONDS = 2
 MAX_IMAGES_PER_REQUEST = 5  # giới hạn của Groq vision model
@@ -197,7 +218,17 @@ def vision_analysis_node(state: AgentState) -> AgentState:
                         "Bạn là kỹ sư phân tích hình ảnh thiết bị lò hơi / lò dầu tải nhiệt "
                         "công nghiệp. Mô tả ngắn gọn những gì quan sát được trong (các) ảnh sau, "
                         "đặc biệt chú ý các dấu hiệu bất thường: rò rỉ, ăn mòn, cháy nổ, đồng hồ "
-                        "áp suất/nhiệt độ bất thường, kết cấu bị hư hỏng. Trả lời bằng tiếng Việt có dấu."
+                        "áp suất/nhiệt độ bất thường, kết cấu bị hư hỏng.\n\n"
+                        "NẾU ảnh là màn hình SCADA (HMI): hệ thống có QUY ƯỚC MÀU CỐ ĐỊNH cho từng "
+                        "ô thông số - nền màu ĐỎ kèm chữ \"H\" nghĩa là thông số đó đang VƯỢT NGƯỠNG "
+                        "CAO; nền màu VÀNG kèm chữ \"L\" nghĩa là đang THẤP HƠN NGƯỠNG AN TOÀN; nền "
+                        "màu XANH LÁ là bình thường. Hãy QUÉT TOÀN BỘ ảnh tìm CÁC Ô ĐỎ/VÀNG này. "
+                        "Nếu tìm thấy BẤT KỲ ô nào nền đỏ (chữ H), BẮT BUỘC bắt đầu câu trả lời đúng "
+                        "nguyên văn cụm \"Phát hiện cảnh báo đỏ:\" rồi liệt kê tên/vị trí thông số. "
+                        "Nếu tìm thấy ô nền vàng (chữ L) mà KHÔNG có ô đỏ nào, bắt đầu đúng nguyên "
+                        "văn cụm \"Phát hiện cảnh báo vàng:\" rồi liệt kê tên/vị trí thông số. Nếu "
+                        "toàn bộ đều xanh/bình thường, KHÔNG dùng 2 cụm trên, mô tả bình thường. "
+                        "Trả lời bằng tiếng Việt có dấu."
                     ),
                 }
             ]
@@ -379,14 +410,43 @@ def rerank_node(state: AgentState) -> AgentState:
 
 def emergency_router_node(state: AgentState) -> AgentState:
     """
-    Rule Layer - Emergency Router: quét raw_message + vision_summary theo danh
-    sách từ khóa khẩn cấp (tụt áp / rò rỉ / nổ / cháy / quá áp / mất nước / tắt
-    lửa buồng đốt...). Nhờ vậy, nếu Vision Model mô tả ảnh có dấu hiệu sự cố,
-    hệ thống cũng tự động kích hoạt khẩn cấp kể cả khi người dùng không gõ từ
-    khóa đó. Áp dụng cho MỌI role, kể cả ADMIN - an toàn không có ngoại lệ.
+    Rule Layer - Emergency Router: gồm 2 lớp quét ĐỘC LẬP nhau (phân tách theo
+    yêu cầu anh Long 2026-07-14, sau khi xác nhận báo động giả trước đây chỉ
+    xảy ra với câu hỏi văn bản, không phải mô tả ảnh):
+
+    LỚP 1 - quét vision_summary theo VISION_ALERT_MARKERS: LUÔN LUÔN BẬT, không
+    phụ thuộc EMERGENCY_KEYWORD_GATE_ENABLED. An toàn vì vision_summary là mô tả
+    THỰC TẾ do chính Vision Model quan sát ảnh SCADA sinh ra (không phải câu hỏi
+    giả định của người dùng), và cụm từ được thiết kế để Vision Model CHỈ dùng
+    đúng nguyên văn khi thực sự thấy ô đỏ/vàng theo quy ước màu cố định của màn
+    hình SCADA (xem system prompt trong vision_analysis_node) - giảm tối đa rủi
+    ro khớp nhầm so với quét chuỗi con thô.
+
+    LỚP 2 - quét raw_message + vision_summary theo EMERGENCY_KEYWORDS (hành vi
+    CŨ, giữ nguyên 100%): CHỈ BẬT khi EMERGENCY_KEYWORD_GATE_ENABLED=true (mặc
+    định vẫn TẮT như anh Long đã quyết định, vì đây là lớp có rủi ro báo động
+    giả trên câu hỏi thông tin đã xác nhận trước đó).
+
+    Áp dụng cho MỌI role, kể cả ADMIN - an toàn không có ngoại lệ.
     """
+    vision_summary = state.get("vision_summary", "")
+    vision_text_norm = _normalize(vision_summary)
+    vision_found = [kw for kw in VISION_ALERT_MARKERS if _normalize(kw) in vision_text_norm]
+
+    if vision_found:
+        log_line = (
+            f"[emergency_router_node] Vision Model tu phat hien canh bao mau tren anh SCADA "
+            f"(LOP 1 - luon bat, doc lap EMERGENCY_KEYWORD_GATE_ENABLED): {vision_found}"
+        )
+        logger.warning(log_line)
+        return {
+            "is_emergency": True,
+            "keywords_found": vision_found,
+            "routing_log": [log_line],
+        }
+
     if not EMERGENCY_KEYWORD_GATE_ENABLED:
-        log_line = "[emergency_router_node] Lớp chặn từ khóa khẩn cấp đang TẮT (EMERGENCY_KEYWORD_GATE_ENABLED=false) - bỏ qua, đi tiếp standard_llm_node."
+        log_line = "[emergency_router_node] Khong co canh bao mau tu vision (Lop 1). Lop chan tu khoa van ban (Lop 2) dang TAT (EMERGENCY_KEYWORD_GATE_ENABLED=false) - bo qua, di tiep standard_llm_node."
         logger.info(log_line)
         return {
             "is_emergency": False,
@@ -394,11 +454,11 @@ def emergency_router_node(state: AgentState) -> AgentState:
             "routing_log": [log_line],
         }
 
-    combined_text = _normalize(state.get("raw_message", "") + " " + state.get("vision_summary", ""))
+    combined_text = _normalize(state.get("raw_message", "") + " " + vision_summary)
     found = [kw for kw in EMERGENCY_KEYWORDS if _normalize(kw) in combined_text]
     is_emergency = len(found) > 0
 
-    log_line = f"[emergency_router_node] is_emergency={is_emergency} keywords_found={found}"
+    log_line = f"[emergency_router_node] Lop 2 (tu khoa van ban): is_emergency={is_emergency} keywords_found={found}"
     logger.info(log_line)
 
     return {
@@ -413,13 +473,24 @@ def emergency_handler_node(state: AgentState) -> AgentState:
     Xử lý sự cố khẩn cấp: ưu tiên tuyệt đối, KHÔNG gọi LLM (tránh độ trễ / phụ
     thuộc uptime Groq API trong tình huống an toàn), trả về cảnh báo ngay lập
     tức kèm từ khóa đã phát hiện.
+
+    Từ bản này: kèm thêm nguyên văn vision_summary (nếu có) vào tin nhắn cảnh
+    báo - trước đây chỉ liệt kê danh sách từ khóa (vd "canh bao do"), không đủ
+    để ADMIN biết CHÍNH XÁC thông số/vị trí nào đang bất thường mà không phải
+    tự mở lại ảnh đối chiếu.
     """
     keywords = state.get("keywords_found", [])
-    msg = (
-        f"⚠️ CẢNH BÁO KHẨN CẤP: Phát hiện từ khóa sự cố [{', '.join(keywords)}]. "
+    vision_summary = state.get("vision_summary", "")
+
+    lines = [f"⚠️ CẢNH BÁO KHẨN CẤP: Phát hiện dấu hiệu sự cố [{', '.join(keywords)}]."]
+    if vision_summary:
+        lines.append(f"Chi tiết từ phân tích ảnh SCADA: {vision_summary}")
+    lines.append(
         "Hệ thống đã ghi nhận ưu tiên cao nhất. Kỹ sư vận hành vui lòng kiểm tra "
         "hiện trường ngay lập tức và thực hiện quy trình ứng phó khẩn cấp."
     )
+    msg = "\n".join(lines)
+
     logger.critical("[emergency_handler_node] %s", msg)
     return {
         "final_response": msg,
