@@ -44,8 +44,16 @@ import time
 import uuid
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("telegram_bot")
+
+# Render chay server o UTC theo mac dinh - datetime.now() khong co tzinfo se
+# tra ve gio UTC, hien thi SAI 7 tieng so voi gio Viet Nam trong tin nhan Telegram
+# (da xac nhan qua bao cao thuc te: hien 23h30 VN nhung tin bao "16:30"). Dung
+# co dinh Asia/Ho_Chi_Minh (khong doc tu bien moi truong) vi toan bo he thong nay
+# van hanh cho 1 nha may duy nhat tai Viet Nam.
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 ADMIN_ID = os.getenv("ADMIN_ID", "")
 
@@ -522,7 +530,7 @@ def _build_bot(compiled_graph):
                 bot.answer_callback_query(call.id, "Đã xác nhận, tạm ngưng cảnh báo lặp lại.")
                 confirm_note = (
                     f"\n\n✅ ADMIN đã xác nhận lúc "
-                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Tạm ngưng cảnh báo lặp lại."
+                    f"{datetime.now(VN_TZ).strftime('%Y-%m-%d %H:%M:%S')}. Tạm ngưng cảnh báo lặp lại."
                 )
                 try:
                     if call.message.content_type == "photo":
