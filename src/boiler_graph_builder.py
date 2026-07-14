@@ -118,6 +118,15 @@ EMERGENCY_KEYWORDS = [
 # nguong an toan) - nho vay khop chinh xac, giam toi da rui ro bao dong gia so voi
 # quet tu khoa tho tren van ban tu do nguoi dung go.
 VISION_ALERT_MARKERS = [
+    # Cum tu MOI (tu 2026-07-14, theo phan hoi anh Long: "do/vang" khong phai
+    # thuat ngu chuyen nganh - dung dung "vuot nguong" cho canh bao do (H, qua
+    # cao) va "thap" cho canh bao vang (L, duoi nguong an toan)).
+    "phat hien thong so vuot nguong",
+    "phát hiện thông số vượt ngưỡng",
+    "phat hien thong so thap",
+    "phát hiện thông số thấp",
+    # Cum tu THE HE CU (truoc 2026-07-14) - giu lai lam luoi an toan phong khi
+    # Vision Model vi ly do nao do (cache, phien ban khac) van tra ve cum cu.
     "phat hien canh bao do",
     "phát hiện cảnh báo đỏ",
     "phat hien canh bao vang",
@@ -221,13 +230,21 @@ def vision_analysis_node(state: AgentState) -> AgentState:
                         "áp suất/nhiệt độ bất thường, kết cấu bị hư hỏng.\n\n"
                         "NẾU ảnh là màn hình SCADA (HMI): hệ thống có QUY ƯỚC MÀU CỐ ĐỊNH cho từng "
                         "ô thông số - nền màu ĐỎ kèm chữ \"H\" nghĩa là thông số đó đang VƯỢT NGƯỠNG "
-                        "CAO; nền màu VÀNG kèm chữ \"L\" nghĩa là đang THẤP HƠN NGƯỠNG AN TOÀN; nền "
-                        "màu XANH LÁ là bình thường. Hãy QUÉT TOÀN BỘ ảnh tìm CÁC Ô ĐỎ/VÀNG này. "
+                        "(quá cao); nền màu VÀNG kèm chữ \"L\" nghĩa là đang THẤP HƠN NGƯỠNG AN TOÀN "
+                        "(quá thấp); nền màu XANH LÁ là bình thường. Hãy QUÉT TOÀN BỘ ảnh tìm CÁC Ô "
+                        "ĐỎ/VÀNG này.\n"
                         "Nếu tìm thấy BẤT KỲ ô nào nền đỏ (chữ H), BẮT BUỘC bắt đầu câu trả lời đúng "
-                        "nguyên văn cụm \"Phát hiện cảnh báo đỏ:\" rồi liệt kê tên/vị trí thông số. "
+                        "nguyên văn cụm \"Phát hiện thông số vượt ngưỡng:\" rồi liệt kê TỪNG thông số "
+                        "theo đúng mẫu \"<tên thông số đọc trên màn hình bằng tiếng Việt> đang Cao "
+                        "(kèm giá trị đọc được)\", ví dụ \"Mức nước bồn đang Cao (96.6%)\". "
                         "Nếu tìm thấy ô nền vàng (chữ L) mà KHÔNG có ô đỏ nào, bắt đầu đúng nguyên "
-                        "văn cụm \"Phát hiện cảnh báo vàng:\" rồi liệt kê tên/vị trí thông số. Nếu "
-                        "toàn bộ đều xanh/bình thường, KHÔNG dùng 2 cụm trên, mô tả bình thường. "
+                        "văn cụm \"Phát hiện thông số thấp:\" rồi liệt kê TỪNG thông số theo đúng mẫu "
+                        "\"<tên thông số đọc trên màn hình bằng tiếng Việt> đang Thấp (kèm giá trị đọc "
+                        "được)\", ví dụ \"Nhiệt độ buồng đốt đang Thấp (104 độ C)\". LUÔN ưu tiên dùng "
+                        "tên thông số bằng tiếng Việt hiển thị trên màn hình (không chỉ nêu mã tag kỹ "
+                        "thuật như PT04, TT09 một mình) và KHÔNG dùng cụm \"cảnh báo đỏ\"/\"cảnh báo "
+                        "vàng\" (không phải thuật ngữ vận hành đúng chuẩn). Nếu toàn bộ đều xanh/bình "
+                        "thường, KHÔNG dùng 2 cụm cố định trên, mô tả bình thường. "
                         "Trả lời bằng tiếng Việt có dấu."
                     ),
                 }
