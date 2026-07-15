@@ -470,11 +470,11 @@ PARAM_PLAUSIBLE_RANGES: list[tuple[str, float, float]] = [
     ("áp suất hơi", 0, 25),          # Bar - ap suat hoi lo hoi cong nghiep pho bien
     ("mức nước", 0, 100),             # % - muc nuoc luon trong khoang 0-100%
     ("pt0", 0, 100),                  # % - cac tag PT0x hien dang % (vd PT04)
-    ("quạt gió cấp 1", 0, 60),        # Hz - tan so bien tan pho bien 0-60Hz
-    ("quạt gió cấp 2", 0, 60),        # Hz
-    ("quạt hút khói", 0, 60),         # Hz
+    ("quạt gió cấp 1", 0, 50),        # Hz - tan so bien tan pho bien 0-50Hz
+    ("quạt gió cấp 2", 0, 50),        # Hz
+    ("quạt hút khói", 0, 50),         # Hz
     ("dòng", 0, 200),                 # A - dong dien dong co (ap dung chung moi dong "... dong")
-    ("áp suất dầu", 0, 35),           # Mpa - he thuy luc cong nghiep pho bien toi ~35 Mpa
+    ("áp suất dầu", 0, 20),           # Mpa - he thuy luc cong nghiep pho bien toi ~20 Mpa
 ]
 
 
