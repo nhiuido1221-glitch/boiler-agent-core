@@ -228,6 +228,17 @@ def vision_analysis_node(state: AgentState) -> AgentState:
                         "công nghiệp. Mô tả ngắn gọn những gì quan sát được trong (các) ảnh sau, "
                         "đặc biệt chú ý các dấu hiệu bất thường: rò rỉ, ăn mòn, cháy nổ, đồng hồ "
                         "áp suất/nhiệt độ bất thường, kết cấu bị hư hỏng.\n\n"
+                        "LƯU Ý QUAN TRỌNG VỀ BẢNG CÀI ĐẶT GHI (Cấp liệu 1, Ghi 2, Ghi 3, Ghi 4, Ghi 5 - "
+                        "có thể hiển thị dưới nhãn \"BEN 1\" đến \"BEN 5\"): đây là bảng CÀI ĐẶT PAUSE "
+                        "TIME (thời gian dừng của từng tầng ghi, đơn vị giây) - các ô PV/SV/H/L/LL "
+                        "trong bảng này là THÔNG SỐ ĐIỀU KHIỂN TỐC ĐỘ GHI, KHÔNG PHẢI cảm biến áp "
+                        "suất/nhiệt độ/lưu lượng. TUYỆT ĐỐI KHÔNG được gọi giá trị PV trong bảng này "
+                        "là \"áp suất dầu\", \"Mpa\", \"Bar\" hay bất kỳ đơn vị đo lường vật lý nào - đây "
+                        "là lỗi nghiêm trọng đã từng xảy ra thực tế (PV=108 của \"Ben 5\" - vốn chỉ là "
+                        "giá trị đếm Pause Time đang chạy bình thường - bị gọi nhầm thành \"áp suất dầu "
+                        "108 Mpa\" và báo động giả). KHÔNG coi các bảng Cấp liệu(1)/Ghi 2-5/BEN 1-5 này "
+                        "là nguồn phát hiện cảnh báo đỏ/vàng - bảng này chỉ để tham khảo cấu hình vận "
+                        "hành, KHÔNG dùng để kích hoạt cảnh báo khẩn cấp.\n\n"
                         "NẾU ảnh là màn hình SCADA (HMI): hệ thống có QUY ƯỚC MÀU CỐ ĐỊNH cho từng "
                         "ô thông số - nền màu ĐỎ kèm chữ \"H\" nghĩa là thông số đó đang VƯỢT NGƯỠNG "
                         "(quá cao); nền màu VÀNG kèm chữ \"L\" nghĩa là đang THẤP HƠN NGƯỠNG AN TOÀN "
@@ -441,6 +452,78 @@ def rerank_node(state: AgentState) -> AgentState:
             }
 
 
+# ==============================================================================
+# LOC NGUONG VAT LY HOP LY (sanity check - 2026-07-15, phan hoi anh Long sau khi
+# thay 1 canh bao that co gia tri PHI THUC TE: "Ben 5 ap suat dau dang Cao (108
+# Mpa)" - qua cao so voi he thuy luc cong nghiep thuc te, nhieu kha nang Vision
+# Model doc nham chu so tu anh chup). Day KHONG phai nguong H/L that cua SCADA
+# (SCADA da tu quyet dinh mau do/vang dung theo nguong that cua no roi) - bang
+# nay CHI la luoi an toan chan cac gia tri KHONG THE nao dung trong thuc te,
+# giam rui ro bao dong gia do AI doc sai anh (lech dau phay, nham don vi...).
+#
+# QUAN TRONG: day la GIA TRI UOC LUONG BAN DAU, dat RONG de tranh bo sot canh
+# bao that - anh Long CAN chinh lai cho khop dung thong so ky thuat thuc te
+# cua tung thiet bi (ap suat dinh muc, dong dinh muc dong co...) neu thay chua
+# phu hop. Moi phan tu: (chuoi con de nhan dien ten thong so - khong phan biet
+# hoa/thuong/dau, gia tri toi thieu hop ly, gia tri toi da hop ly).
+PARAM_PLAUSIBLE_RANGES: list[tuple[str, float, float]] = [
+    ("áp suất hơi", 0, 25),          # Bar - ap suat hoi lo hoi cong nghiep pho bien
+    ("mức nước", 0, 100),             # % - muc nuoc luon trong khoang 0-100%
+    ("pt0", 0, 100),                  # % - cac tag PT0x hien dang % (vd PT04)
+    ("quạt gió cấp 1", 0, 60),        # Hz - tan so bien tan pho bien 0-60Hz
+    ("quạt gió cấp 2", 0, 60),        # Hz
+    ("quạt hút khói", 0, 60),         # Hz
+    ("dòng", 0, 200),                 # A - dong dien dong co (ap dung chung moi dong "... dong")
+    ("áp suất dầu", 0, 35),           # Mpa - he thuy luc cong nghiep pho bien toi ~35 Mpa
+]
+
+
+def _is_plausible_value(name: str, value: float) -> bool:
+    """Kiem tra 1 gia tri doc duoc co nam trong khoang HOP LY VAT LY khong, dua
+    tren PARAM_PLAUSIBLE_RANGES (khop theo chuoi con trong ten, khong phan biet
+    hoa/thuong/dau). Neu KHONG co quy tac nao khop ten thong so, MAC DINH coi
+    la hop le (khong loc) - tranh bo sot canh bao that chi vi thieu du lieu
+    ngoung cho thong so do."""
+    name_norm = _normalize(name)
+    for pattern, lo, hi in PARAM_PLAUSIBLE_RANGES:
+        if pattern in name_norm:
+            return lo <= value <= hi
+    return True
+
+
+# Khop 1 dong phat hien dang "- <ten> dang Cao/Thap (<gia tri><don vi>)" do
+# Vision Model sinh ra (dung mau cau da quy dinh trong vision_analysis_node).
+_FINDING_LINE_RE = re.compile(
+    r"^-\s*(?P<name>.+?)\s+đang\s+(?P<status>Cao|Thấp)\s*\(\s*(?P<value>[+-]?\d+(?:[.,]\d+)?)\s*(?P<unit>[^)]*)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _filter_implausible_findings(vision_summary: str) -> tuple[str, list[str]]:
+    """Duyet tung dong trong vision_summary, LOAI BO cac dong khop mau phat
+    hien nhung co gia tri PHI THUC TE (ngoai PARAM_PLAUSIBLE_RANGES) - cac dong
+    khac (dong tieu de "Phat hien thong so...", dong khong khop mau, hoac mo ta
+    binh thuong) GIU NGUYEN khong dong cham. Tra ve (van ban da loc, danh sach
+    dong bi loai kem ly do - de ghi log canh bao)."""
+    kept_lines: list[str] = []
+    dropped_lines: list[str] = []
+    for line in vision_summary.splitlines():
+        m = _FINDING_LINE_RE.match(line.strip())
+        if not m:
+            kept_lines.append(line)
+            continue
+        try:
+            value = float(m.group("value").replace(",", "."))
+        except ValueError:
+            kept_lines.append(line)
+            continue
+        if _is_plausible_value(m.group("name"), value):
+            kept_lines.append(line)
+        else:
+            dropped_lines.append(line.strip())
+    return "\n".join(kept_lines), dropped_lines
+
+
 def emergency_router_node(state: AgentState) -> AgentState:
     """
     Rule Layer - Emergency Router: gồm 2 lớp quét ĐỘC LẬP nhau (phân tách theo
@@ -453,7 +536,9 @@ def emergency_router_node(state: AgentState) -> AgentState:
     giả định của người dùng), và cụm từ được thiết kế để Vision Model CHỈ dùng
     đúng nguyên văn khi thực sự thấy ô đỏ/vàng theo quy ước màu cố định của màn
     hình SCADA (xem system prompt trong vision_analysis_node) - giảm tối đa rủi
-    ro khớp nhầm so với quét chuỗi con thô.
+    ro khớp nhầm so với quét chuỗi con thô. TỪ 2026-07-15: sau khi khớp marker,
+    LỌC THÊM theo PARAM_PLAUSIBLE_RANGES - nếu TOÀN BỘ giá trị phát hiện đều
+    phi thực tế (nhiều khả năng AI đọc nhầm ảnh), KHÔNG tính là khẩn cấp.
 
     LỚP 2 - quét raw_message + vision_summary theo EMERGENCY_KEYWORDS (hành vi
     CŨ, giữ nguyên 100%): CHỈ BẬT khi EMERGENCY_KEYWORD_GATE_ENABLED=true (mặc
@@ -467,16 +552,36 @@ def emergency_router_node(state: AgentState) -> AgentState:
     vision_found = [kw for kw in VISION_ALERT_MARKERS if _normalize(kw) in vision_text_norm]
 
     if vision_found:
-        log_line = (
-            f"[emergency_router_node] Vision Model tu phat hien canh bao mau tren anh SCADA "
-            f"(LOP 1 - luon bat, doc lap EMERGENCY_KEYWORD_GATE_ENABLED): {vision_found}"
-        )
-        logger.warning(log_line)
-        return {
-            "is_emergency": True,
-            "keywords_found": vision_found,
-            "routing_log": [log_line],
-        }
+        filtered_summary, dropped_lines = _filter_implausible_findings(vision_summary)
+        if dropped_lines:
+            logger.warning(
+                "[emergency_router_node] Da loc bo %d dong PHI THUC TE (gia tri vuot khoang "
+                "hop ly vat ly - nhieu kha nang AI doc nham anh, xem PARAM_PLAUSIBLE_RANGES): %s",
+                len(dropped_lines), dropped_lines,
+            )
+        remaining_findings = [
+            ln for ln in filtered_summary.splitlines() if _FINDING_LINE_RE.match(ln.strip())
+        ]
+        if remaining_findings:
+            log_line = (
+                f"[emergency_router_node] Vision Model tu phat hien canh bao mau tren anh SCADA "
+                f"(LOP 1 - luon bat, doc lap EMERGENCY_KEYWORD_GATE_ENABLED), con lai "
+                f"{len(remaining_findings)} dong hop le sau loc: {vision_found}"
+            )
+            logger.warning(log_line)
+            return {
+                "is_emergency": True,
+                "keywords_found": vision_found,
+                "vision_summary": filtered_summary,
+                "routing_log": [log_line],
+            }
+        else:
+            logger.warning(
+                "[emergency_router_node] Vision Model bao canh bao nhung TOAN BO gia tri deu "
+                "PHI THUC TE sau khi loc (nhieu kha nang doc nham anh) - KHONG tinh la khan "
+                "cap, tiep tuc kiem tra Lop 2 / standard_llm_node nhu binh thuong."
+            )
+            # KHONG return o day - roi xuong duoi tiep tuc nhu khong co canh bao vision nao.
 
     if not EMERGENCY_KEYWORD_GATE_ENABLED:
         log_line = "[emergency_router_node] Khong co canh bao mau tu vision (Lop 1). Lop chan tu khoa van ban (Lop 2) dang TAT (EMERGENCY_KEYWORD_GATE_ENABLED=false) - bo qua, di tiep standard_llm_node."
