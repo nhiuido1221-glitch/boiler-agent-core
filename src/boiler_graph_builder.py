@@ -614,6 +614,50 @@ def emergency_router_node(state: AgentState) -> AgentState:
     }
 
 
+
+# ==============================================================================
+# BO QUA LLM CHO KIEM TRA DINH KY KHONG CANH BAO (2026-07-21 - fix that su, xem
+# routing_log): Supabase log thuc te cho thay Station Agent chay 1 job "KIEM TRA
+# DINH KY 5 PHUT" - moi 5 phut chup anh + goi /invoke 1 lan, TRUOC BAN VA NAY moi
+# lan deu di het qua standard_llm_node (RAG + system prompt dai, ~5200 token/lan)
+# DU KHONG CO CANH BAO GI CA. Tinh ra 12 lan/gio x 5200 token x 24h ~ 1.5 TRIEU
+# token/ngay, trong khi han muc mien phi Groq cho model "openai/gpt-oss-120b" chi
+# 200,000 token/ngay (TPD) - vuot ~7.5 lan, dan toi loi 429 rate_limit_exceeded
+# lien tuc gan nhu ca ngay (da xac nhan qua execute_sql: 10-13/12 lan goi moi gio
+# that bai lien tuc suot 20+ gio). Day la nguyen nhan CHINH khien bot "van khong
+# duoc" ke ca sau khi da doi model vision.
+#
+# Fix: neu la 1 lan KIEM TRA DINH KY va KHONG co canh bao (is_emergency=False),
+# BO QUA HOAN TOAN standard_llm_node (khong goi Groq lan nao them) - chi ghi log
+# im lang qua logging_node. Cau hoi THAT cua nguoi dung (khong co marker nay) va
+# moi truong hop CO canh bao van di qua binh thuong nhu cu, khong bi anh huong.
+PERIODIC_CHECK_MARKER = "kiem tra dinh ky"
+
+
+def _is_periodic_check(raw_message: str) -> bool:
+    return PERIODIC_CHECK_MARKER in _normalize(raw_message)
+
+
+def skip_llm_node(state: AgentState) -> AgentState:
+    """
+    Nhanh "tiet kiem token": danh cho cac lan KIEM TRA DINH KY khong phat hien
+    canh bao gi - KHONG goi Groq (ca vision lan text deu da chay xong o cac node
+    truoc, o day chi la quyet dinh KHONG goi them standard_llm_node nua). Tra ve
+    final_response RONG (khong gui thong bao "van binh thuong" ve Telegram moi 5
+    phut - se spam group vo ich) - main.py/telegram_bot.py chi nen gui Telegram
+    khi is_emergency=True hoac final_response khac rong.
+    """
+    log_line = (
+        "[skip_llm_node] Kiem tra dinh ky, khong co canh bao - BO QUA "
+        "standard_llm_node de tiet kiem token (xem PERIODIC_CHECK_MARKER)."
+    )
+    logger.info(log_line)
+    return {
+        "final_response": "",
+        "routing_log": [log_line],
+    }
+
+
 def emergency_handler_node(state: AgentState) -> AgentState:
     """
     Xử lý sự cố khẩn cấp: ưu tiên tuyệt đối, KHÔNG gọi LLM (tránh độ trễ / phụ
@@ -914,15 +958,23 @@ def loop_guard_edge(state: AgentState) -> Literal["circuit_breaker", "continue"]
     return "continue"
 
 
-def post_rule_layer_edge(state: AgentState) -> Literal["emergency", "standard"]:
+def post_rule_layer_edge(state: AgentState) -> Literal["emergency", "standard", "skip_llm"]:
     """
     Định tuyến sau Rule Layer: Emergency luôn ưu tiên tuyệt đối (kể cả với
     ADMIN - an toàn không có ngoại lệ). Mọi trường hợp còn lại (OPERATOR lẫn
     ADMIN) đều đi qua standard_llm_node để nhận câu trả lời THẬT dựa trên RAG
     + LLM, khác với thiết kế trước đó (ADMIN bị chặn ở 1 node trả lời cố định).
+
+    NHÁNH MỚI "skip_llm" (2026-07-21 - fix lỗi 429 rate_limit_exceeded do quá tải
+    token/ngày, xem chi tiết ở skip_llm_node): nếu đây là 1 lần "KIỂM TRA ĐỊNH KỲ"
+    tự động (không phải câu hỏi thật của người dùng) VÀ không có cảnh báo, BỎ QUA
+    standard_llm_node hoàn toàn để không tốn thêm token cho những lần "vẫn bình
+    thường" - vốn chiếm đa số áp đảo số lần gọi mỗi ngày.
     """
     if state.get("is_emergency", False):
         return "emergency"
+    if _is_periodic_check(state.get("raw_message", "")):
+        return "skip_llm"
     return "standard"
 
 
@@ -945,6 +997,7 @@ def build_graph():
     graph.add_node("emergency_router_node", emergency_router_node)
     graph.add_node("emergency_handler_node", emergency_handler_node)
     graph.add_node("standard_llm_node", standard_llm_node)
+    graph.add_node("skip_llm_node", skip_llm_node)
     graph.add_node("logging_node", logging_node)
 
     graph.add_edge(START, "entry_node")
@@ -973,9 +1026,11 @@ def build_graph():
         {
             "emergency": "emergency_handler_node",
             "standard": "standard_llm_node",
+            "skip_llm": "skip_llm_node",
         },
     )
     graph.add_edge("emergency_handler_node", "logging_node")
+    graph.add_edge("skip_llm_node", "logging_node")
     graph.add_edge("standard_llm_node", "logging_node")
 
     graph.add_edge("logging_node", END)
