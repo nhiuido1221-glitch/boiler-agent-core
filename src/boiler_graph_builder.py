@@ -215,7 +215,15 @@ def vision_analysis_node(state: AgentState) -> AgentState:
     for attempt in range(1, MAX_RETRY + 1):
         try:
             vision_llm = ChatGroq(
-                model=os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+                # 2026-07-21: Groq da chinh thuc NGUNG (decommission) ca 2 model vision cu
+                # tung dung ("meta-llama/llama-4-scout-17b-16e-instruct" ngung 2026-06-17,
+                # "meta-llama/llama-4-maverick-17b-128e-instruct" ngung 2026-02-20) - moi
+                # lan goi model cu deu bi Groq tra loi loi ngay lap tuc (model_decommissioned),
+                # khien vision_analysis_node that bai ca 3 lan retry -> vision_summary rong ->
+                # toan bo tinh nang phat hien canh bao qua anh SCADA ngung hoat dong am tham
+                # tu do. Model vision DUY NHAT Groq con ho tro hien tai la "qwen/qwen3.6-27b"
+                # (xem https://console.groq.com/docs/vision) - da chuyen sang model nay.
+                model=os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b"),
                 api_key=os.getenv("GROQ_API_KEY"),
                 temperature=0.2,
                 timeout=45,
